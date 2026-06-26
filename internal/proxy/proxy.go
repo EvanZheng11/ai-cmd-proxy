@@ -211,13 +211,6 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 在 system 前植入中文思考指令（最短版本：~10 token）
-	if ccBody.Params.System != "" {
-		ccBody.Params.System = "推理用中文，回复随用户。\n" + ccBody.Params.System
-	} else {
-		ccBody.Params.System = "推理用中文，回复随用户。"
-	}
-
 	// Create upstream request
 	ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
 	if err != nil {
