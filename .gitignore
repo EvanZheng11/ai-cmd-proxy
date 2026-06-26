@@ -1,16 +1,26 @@
-# IDE & Editors
-.idea/
-.vscode/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.swp
+# Go binaries
+bin/
+*.exe
 
-# Drafts & Claude config
-.drafts/
-.claude/
+# Runtime data
+logs/
+proxy.pid
+proxy-config.json
 
-# OS files
+# Editor/OS
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Temp
+_temp/
+
+# Hana skill installation
+.hanako/

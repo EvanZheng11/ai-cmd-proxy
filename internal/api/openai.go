@@ -3,13 +3,14 @@ package api
 // OpenAI-compatible types (client-facing)
 
 type OpenAIMessage struct {
-	Role       string        `json:"role"`
-	Content    interface{}   `json:"content,omitempty"`
-	Name       string        `json:"name,omitempty"`
-	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-	Refusal    string        `json:"refusal,omitempty"`
-	Audio      *MessageAudio `json:"audio,omitempty"`
+	Role             string        `json:"role"`
+	Content          interface{}   `json:"content,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+	Name             string        `json:"name,omitempty"`
+	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	Refusal          string        `json:"refusal,omitempty"`
+	Audio            *MessageAudio `json:"audio,omitempty"`
 }
 
 type ContentPart struct {
@@ -86,10 +87,11 @@ type OpenAIChoice struct {
 }
 
 type OpenAIDelta struct {
-	Role      string                `json:"role,omitempty"`
-	Content   string                `json:"content,omitempty"`
-	ToolCalls []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
-	Refusal   string                `json:"refusal,omitempty"`
+	Role             string                `json:"role,omitempty"`
+	Content          string                `json:"content,omitempty"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIDeltaToolCall `json:"tool_calls,omitempty"`
+	Refusal          string                `json:"refusal,omitempty"`
 }
 
 type OpenAIDeltaToolCall struct {

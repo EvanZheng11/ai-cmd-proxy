@@ -21,6 +21,13 @@ const defaultBaseURL = "https://api.commandcode.ai"
 const defaultTimeout = 300 * time.Second
 const debugLogLimit = 20000
 
+func safeKeyPrefix(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:8] + "..."
+}
+
 func truncateLog(s string) string {
 	if len(s) <= debugLogLimit {
 		return s
@@ -165,17 +172,22 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get API key from client Authorization header or server default
-	apiKey := r.Header.Get("Authorization")
-	if apiKey != "" {
-		apiKey = strings.TrimPrefix(apiKey, "Bearer ")
-		apiKey = strings.TrimSpace(apiKey)
-	} else if p.APIKey != "" {
-		apiKey = p.APIKey
-	} else {
+	// Get API key: server config takes priority over client header
+	apiKey := p.APIKey
+	if apiKey == "" {
+		// Fall back to client Authorization header
+		clientKey := r.Header.Get("Authorization")
+		if clientKey != "" {
+			apiKey = strings.TrimPrefix(clientKey, "Bearer ")
+			apiKey = strings.TrimSpace(apiKey)
+		}
+	}
+	if apiKey == "" {
 		p.writeOpenAIError(w, http.StatusUnauthorized, "API key required. Set Authorization header.", "authentication_error")
 		return
 	}
+
+	p.debugf("[DEBUG] Using API key: %s...", safeKeyPrefix(apiKey))
 
 	// Read request
 	body, err := io.ReadAll(r.Body)
@@ -202,6 +214,13 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
 		return
+	}
+
+	// 在 system 前植入中文思考指令（最短版本：~10 token）
+	if ccBody.Params.System != "" {
+		ccBody.Params.System = "推理用中文，回复随用户。\n" + ccBody.Params.System
+	} else {
+		ccBody.Params.System = "推理用中文，回复随用户。"
 	}
 
 	// Create upstream request
@@ -281,6 +300,20 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 		switch event.Type {
 		case "text-delta":
 			delta := api.OpenAIDelta{Content: event.Text}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
+		case "thinking-delta", "reasoning-delta":
+			delta := api.OpenAIDelta{ReasoningContent: event.Text}
 			if !sentRole {
 				delta.Role = "assistant"
 				sentRole = true
@@ -443,6 +476,8 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var content strings.Builder
+	var thinking strings.Builder
+	var hasThinking bool
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
@@ -464,6 +499,9 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		switch event.Type {
 		case "text-delta":
 			content.WriteString(event.Text)
+		case "thinking-delta", "reasoning-delta":
+			hasThinking = true
+			thinking.WriteString(event.Text)
 		case "tool-use":
 			hasToolCalls = true
 			toolCallByID[event.ToolCallID] = len(toolCalls)
@@ -535,6 +573,9 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	msg := &api.OpenAIMessage{
 		Role:    "assistant",
 		Content: content.String(),
+	}
+	if hasThinking {
+		msg.ReasoningContent = thinking.String()
 	}
 	finishReason := "stop"
 	if hasToolCalls {
@@ -667,29 +708,41 @@ func responseItemsToMessages(items []any) []api.OpenAIMessage {
 }
 
 // HandleModels handles the /v1/models endpoint
+// Only includes models available on the Go plan (Open Source category)
 func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 	models := api.OpenAIModelList{
 		Object: "list",
 		Data: []api.OpenAIModel{
-			// MoonshotAI
-			{ID: "moonshotai/Kimi-K2.6", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			{ID: "moonshotai/Kimi-K2.5", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			// ZhipuAI
-			{ID: "zai-org/GLM-5.1", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			{ID: "zai-org/GLM-5", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			// MiniMaxAI
-			{ID: "MiniMaxAI/MiniMax-M2.7", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			{ID: "MiniMaxAI/MiniMax-M2.5", Object: "model", Created: 0, OwnedBy: "minimaxai"},
 			// DeepSeek
-			{ID: "deepseek/deepseek-v4-pro", Object: "model", Created: 0, OwnedBy: "deepseek"},
-			{ID: "deepseek/deepseek-v4-flash", Object: "model", Created: 0, OwnedBy: "deepseek"},
+			{ID: "deepseek-v4-pro", Object: "model", Created: 0, OwnedBy: "deepseek"},
+			{ID: "deepseek-v4-flash", Object: "model", Created: 0, OwnedBy: "deepseek"},
+			// Kimi (MoonshotAI)
+			{ID: "kimi-k2.7-code", Object: "model", Created: 0, OwnedBy: "moonshotai"},
+			{ID: "kimi-k2.7-code-highspeed", Object: "model", Created: 0, OwnedBy: "moonshotai"},
+			{ID: "kimi-k2.6", Object: "model", Created: 0, OwnedBy: "moonshotai"},
+			{ID: "kimi-k2.5", Object: "model", Created: 0, OwnedBy: "moonshotai"},
+			// ZhipuAI (GLM)
+			{ID: "glm-5.2", Object: "model", Created: 0, OwnedBy: "zhipuai"},
+			{ID: "glm-5.2-fast", Object: "model", Created: 0, OwnedBy: "zhipuai"},
+			{ID: "glm-5.1", Object: "model", Created: 0, OwnedBy: "zhipuai"},
+			{ID: "glm-5", Object: "model", Created: 0, OwnedBy: "zhipuai"},
+			// MiniMax
+			{ID: "minimax-m3", Object: "model", Created: 0, OwnedBy: "minimaxai"},
+			{ID: "minimax-m2.7", Object: "model", Created: 0, OwnedBy: "minimaxai"},
+			{ID: "minimax-m2.5", Object: "model", Created: 0, OwnedBy: "minimaxai"},
+			// Xiaomi (MiMo)
+			{ID: "mimo-v2.5-pro", Object: "model", Created: 0, OwnedBy: "xiaomi"},
+			{ID: "mimo-v2.5", Object: "model", Created: 0, OwnedBy: "xiaomi"},
 			// Qwen
-			{ID: "Qwen/Qwen3.6-Max-Preview", Object: "model", Created: 0, OwnedBy: "qwen"},
-			{ID: "Qwen/Qwen3.6-Plus", Object: "model", Created: 0, OwnedBy: "qwen"},
+			{ID: "qwen-3.7-max", Object: "model", Created: 0, OwnedBy: "qwen"},
+			{ID: "qwen-3.7-plus", Object: "model", Created: 0, OwnedBy: "qwen"},
+			{ID: "qwen-3.6-max-preview", Object: "model", Created: 0, OwnedBy: "qwen"},
+			{ID: "qwen-3.6-plus", Object: "model", Created: 0, OwnedBy: "qwen"},
 			// StepFun
-			{ID: "stepfun/Step-3.5-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-			// Google
-			{ID: "google/gemini-3.1-flash-lite", Object: "model", Created: 0, OwnedBy: "google"},
+			{ID: "step-3.7-flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
+			{ID: "step-3.5-flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
+			// NVIDIA
+			{ID: "nemotron-3-ultra", Object: "model", Created: 0, OwnedBy: "nvidia"},
 		},
 	}
 	w.Header().Set("Content-Type", "application/json")
