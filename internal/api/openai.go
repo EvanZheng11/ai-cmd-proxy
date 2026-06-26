@@ -107,9 +107,19 @@ type OpenAIDeltaFunction struct {
 }
 
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                       `json:"prompt_tokens"`
+	CompletionTokens        int                       `json:"completion_tokens"`
+	TotalTokens             int                       `json:"total_tokens"`
+	PromptTokensDetails     *OpenAIUsagePromptDetails `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *OpenAIUsageCompDetails   `json:"completion_tokens_details,omitempty"`
+}
+
+type OpenAIUsagePromptDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+type OpenAIUsageCompDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 type OpenAIChatResponse struct {

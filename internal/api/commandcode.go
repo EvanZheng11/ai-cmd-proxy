@@ -28,7 +28,7 @@ type CCMessage struct {
 type CCChatParams struct {
 	Model       string      `json:"model"`
 	Messages    []CCMessage `json:"messages"`
-	Tools       []any       `json:"tools"`
+	Tools       []any       `json:"tools,omitempty"`
 	System      string      `json:"system"`
 	MaxTokens   int         `json:"max_tokens"`
 	Temperature float64     `json:"temperature"`
@@ -50,8 +50,8 @@ type CCConfig struct {
 type CCRequestBody struct {
 	Config   CCConfig     `json:"config"`
 	Memory   string       `json:"memory"`
-	Taste    string       `json:"taste"`
-	Skills   string       `json:"skills"`
+	Taste    string       `json:"taste,omitempty"`
+	Skills   string       `json:"skills,omitempty"`
 	Params   CCChatParams `json:"params"`
 	ThreadID string       `json:"threadId"`
 }
@@ -69,8 +69,14 @@ type CCStreamEvent struct {
 		Message    string `json:"message"`
 		StatusCode *int   `json:"statusCode"`
 	} `json:"error"`
-	TotalUsage *struct {
-		InputTokens  int `json:"inputTokens"`
-		OutputTokens int `json:"outputTokens"`
-	} `json:"totalUsage"`
+	TotalUsage *CCUsage `json:"totalUsage"`
+	Usage      *CCUsage `json:"usage"`
+}
+
+type CCUsage struct {
+	InputTokens         int `json:"inputTokens"`
+	OutputTokens        int `json:"outputTokens"`
+	TotalTokens         int `json:"totalTokens"`
+	CachedInputTokens   int `json:"cachedInputTokens"`
+	ReasoningTokens     int `json:"reasoningTokens"`
 }

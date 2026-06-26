@@ -108,15 +108,10 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 			Date:          time.Now().Format("2006-01-02"),
 			Environment:   "cli",
 			Structure:     []string{},
-			IsGitRepo:     false,
-			CurrentBranch: "",
 			MainBranch:    "main",
-			GitStatus:     "",
 			RecentCommits: []string{},
 		},
 		Memory: "",
-		Taste:  "",
-		Skills: "",
 		Params: api.CCChatParams{
 			Model:       model,
 			Messages:    ccMessages,
@@ -478,7 +473,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	var content strings.Builder
 	var thinking strings.Builder
 	var hasThinking bool
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cachedInputTokens, reasoningTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
 	toolCallByID := map[string]int{}
@@ -564,6 +559,8 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 			if event.TotalUsage != nil {
 				inputTokens = event.TotalUsage.InputTokens
 				outputTokens = event.TotalUsage.OutputTokens
+				cachedInputTokens = event.TotalUsage.CachedInputTokens
+				reasoningTokens = event.TotalUsage.ReasoningTokens
 			}
 		case "error":
 			log.Printf("[ERROR] Stream error: %v", event.Error)
@@ -598,6 +595,12 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 			PromptTokens:     inputTokens,
 			CompletionTokens: outputTokens,
 			TotalTokens:      inputTokens + outputTokens,
+			PromptTokensDetails: &api.OpenAIUsagePromptDetails{
+				CachedTokens: cachedInputTokens,
+			},
+			CompletionTokensDetails: &api.OpenAIUsageCompDetails{
+				ReasoningTokens: reasoningTokens,
+			},
 		},
 	}
 
