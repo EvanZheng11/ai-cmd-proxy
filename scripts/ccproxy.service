@@ -1,0 +1,22 @@
+[Unit]
+Description=CommandCode Proxy v2 (Multi-Key OpenAI Proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ccproxy
+ExecStart=/opt/ccproxy/command-code-proxy -data-dir /opt/ccproxy/data -host 0.0.0.0 -port 55990
+Restart=always
+RestartSec=5
+# 优雅关闭：给 10 秒保存 key 状态
+TimeoutStopSec=10
+KillSignal=SIGTERM
+# 资源限制
+LimitNOFILE=65535
+# 环境变量可在此注入首个 Key（池空时自动导入）
+# Environment=CC_API_KEY=user_xxx
+
+[Install]
+WantedBy=multi-user.target

@@ -12,12 +12,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dev2k6/command-code-proxy-server/internal/api"
-	"github.com/dev2k6/command-code-proxy-server/internal/version"
 	"github.com/google/uuid"
+	"github.com/hayou2002/command-code-proxy/internal/api"
+	"github.com/hayou2002/command-code-proxy/internal/keypool"
+	"github.com/hayou2002/command-code-proxy/internal/models"
 )
 
-const defaultBaseURL = "https://api.commandcode.ai"
 const defaultTimeout = 300 * time.Second
 const debugLogLimit = 20000
 
@@ -52,112 +52,41 @@ func (p *Proxy) writeOpenAIError(w http.ResponseWriter, status int, message, err
 	}})
 }
 
-func normalizeFinishReason(reason string) string {
-	switch reason {
-	case "tool_calls", "tool-calls":
-		return "tool_calls"
-	case "length", "max_tokens":
-		return "length"
-	case "content_filter", "content-filter":
-		return "content_filter"
-	default:
-		return "stop"
-	}
-}
-
-// Proxy struct
+// Proxy is the OpenAI-compatible proxy to CommandCode Provider API
 type Proxy struct {
-	APIKey  string
 	BaseURL string
 	Client  *http.Client
 	Debug   bool
+	Keys    *keypool.KeyManager
+	Models  *models.ModelStore
 }
 
 // NewProxy creates a new proxy instance
-func NewProxy(apiKey string) *Proxy {
+func NewProxy(baseURL string, keys *keypool.KeyManager, models *models.ModelStore) *Proxy {
+	if baseURL == "" {
+		baseURL = "https://api.commandcode.ai"
+	}
 	return &Proxy{
-		APIKey:  apiKey,
-		BaseURL: defaultBaseURL,
+		BaseURL: baseURL,
 		Client:  &http.Client{Timeout: defaultTimeout},
+		Keys:    keys,
+		Models:  models,
 	}
 }
 
-// BuildRequest builds the CommandCode request body
-func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody, error) {
-	model := MapModel(openAIReq.Model)
-	system, msgs := ExtractSystem(openAIReq.Messages)
-	ccMessages := ConvertMessages(msgs)
-
-	temperature := 0.3
-	maxTokens := 64000
-	if openAIReq.Temperature != nil {
-		temperature = *openAIReq.Temperature
-	}
-	if openAIReq.MaxTokens != nil {
-		maxTokens = *openAIReq.MaxTokens
-	}
-	if openAIReq.MaxCompletionTokens != nil {
-		maxTokens = *openAIReq.MaxCompletionTokens
-	}
-
-	tools := ConvertTools(openAIReq.Tools)
-
-	ccBody := api.CCRequestBody{
-		Config: api.CCConfig{
-			WorkingDir:    ".",
-			Date:          time.Now().Format("2006-01-02"),
-			Environment:   "cli",
-			Structure:     []string{},
-			MainBranch:    "main",
-			RecentCommits: []string{},
-		},
-		Memory: "",
-		Params: api.CCChatParams{
-			Model:       model,
-			Messages:    ccMessages,
-			Tools:       tools,
-			System:      system,
-			MaxTokens:   maxTokens,
-			Temperature: temperature,
-			Stream:      true,
-		},
-		ThreadID: uuid.New().String(),
-	}
-
-	return ccBody, nil
+// upstreamURL returns the provider chat completions endpoint
+func (p *Proxy) upstreamURL() string {
+	return strings.TrimRight(p.BaseURL, "/") + "/provider/v1/chat/completions"
 }
 
-// CreateUpstreamRequest creates a new HTTP request to the CommandCode API
-func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, apiKey string) (*http.Request, error) {
-	reqJSON, err := json.Marshal(ccBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %w", err)
+// buildUpstreamBody maps the model to a full upstream id and re-marshals
+func (p *Proxy) buildUpstreamBody(openAIReq api.OpenAIChatRequest) ([]byte, error) {
+	// Model resolution: short name -> full id (provider API requires full id)
+	mapped := p.Models.Resolve(openAIReq.Model)
+	if mapped != openAIReq.Model {
+		openAIReq.Model = mapped
 	}
-
-	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
-
-	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		p.BaseURL+"/alpha/generate", bytes.NewReader(reqJSON))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create upstream request: %w", err)
-	}
-
-	ccReq.Header.Set("Content-Type", "application/json")
-	ccReq.Header.Set("Authorization", "Bearer "+apiKey)
-	ccReq.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
-	ccReq.Header.Set("x-cli-environment", "production")
-	ccReq.Header.Set("Accept", "text/event-stream")
-
-	return ccReq, nil
-}
-
-// CallUpstream makes the request to CommandCode API
-func (p *Proxy) CallUpstream(req *http.Request) (*http.Response, error) {
-	resp, err := p.Client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("upstream error: %w", err)
-	}
-	return resp, nil
+	return json.Marshal(openAIReq)
 }
 
 // HandleChatCompletions handles the /v1/chat/completions endpoint
@@ -167,30 +96,12 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get API key: server config takes priority over client header
-	apiKey := p.APIKey
-	if apiKey == "" {
-		// Fall back to client Authorization header
-		clientKey := r.Header.Get("Authorization")
-		if clientKey != "" {
-			apiKey = strings.TrimPrefix(clientKey, "Bearer ")
-			apiKey = strings.TrimSpace(apiKey)
-		}
-	}
-	if apiKey == "" {
-		p.writeOpenAIError(w, http.StatusUnauthorized, "API key required. Set Authorization header.", "authentication_error")
-		return
-	}
-
-	p.debugf("[DEBUG] Using API key: %s...", safeKeyPrefix(apiKey))
-
-	// Read request
+	// Read client request
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusBadRequest, "Failed to read body", "invalid_request_error")
 		return
 	}
-
 	p.debugf("[DEBUG] Client request body: %s", truncateLog(string(body)))
 
 	var openAIReq api.OpenAIChatRequest
@@ -198,74 +109,130 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		p.writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %s", err.Error()), "invalid_request_error")
 		return
 	}
-
 	if len(openAIReq.Messages) == 0 {
 		p.writeOpenAIError(w, http.StatusBadRequest, "messages array is required", "invalid_request_error")
 		return
 	}
 
-	// Build CommandCode request
-	ccBody, err := p.BuildRequest(openAIReq)
+	upBody, err := p.buildUpstreamBody(openAIReq)
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
 		return
 	}
+	p.debugf("[DEBUG] Upstream request body: %s", truncateLog(string(upBody)))
 
-	// Create upstream request
-	ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
-	if err != nil {
-		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
+	// Pick an available key
+	apiKey := p.Keys.GetNext()
+	if apiKey == nil {
+		p.writeOpenAIError(w, http.StatusTooManyRequests,
+			"所有 Key 均不可用（冷却/限额/禁用），请稍后重试", "rate_limit_error")
 		return
 	}
+	p.debugf("[DEBUG] Using API key: %s (%s)", apiKey.Name, safeKeyPrefix(apiKey.Key))
 
-	// Call upstream
-	ccResp, err := p.CallUpstream(ccReq)
+	// Call upstream; retry once with next key on 429
+	ccResp, usedKey, err := p.callUpstreamWithRetry(r.Context(), upBody, apiKey)
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusBadGateway, err.Error(), "api_error")
 		return
 	}
 	defer ccResp.Body.Close()
 
+	if ccResp.StatusCode == http.StatusTooManyRequests {
+		errBody, _ := io.ReadAll(ccResp.Body)
+		p.writeOpenAIError(w, http.StatusTooManyRequests,
+			"所有 Key 均被限流，请稍后重试: "+truncateLog(string(errBody)), "rate_limit_error")
+		return
+	}
+
 	if ccResp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(ccResp.Body)
-		message := fmt.Sprintf("Upstream error: %s", string(errBody))
-		log.Printf("[ERROR] Upstream returned %d: %s", ccResp.StatusCode, string(errBody))
+		message := fmt.Sprintf("Upstream error: %s", truncateLog(string(errBody)))
+		log.Printf("[ERROR] Upstream returned %d: %s", ccResp.StatusCode, truncateLog(string(errBody)))
 		status := http.StatusBadGateway
 		if ccResp.StatusCode >= http.StatusBadRequest && ccResp.StatusCode < http.StatusInternalServerError {
 			status = ccResp.StatusCode
+		}
+		if ccResp.StatusCode == http.StatusUnauthorized || ccResp.StatusCode == http.StatusForbidden {
+			p.Keys.MarkError(usedKey.Key, fmt.Sprintf("%d auth error", ccResp.StatusCode))
 		}
 		p.writeOpenAIError(w, status, message, "api_error")
 		return
 	}
 
-	requestID := "chatcmpl-" + uuid.New().String()[:29]
-	created := time.Now().Unix()
+	p.Keys.MarkSuccess(usedKey.Key)
 
 	if openAIReq.Stream {
-		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created)
+		p.streamPassThrough(w, r, ccResp, openAIReq.Model)
 	} else {
-		p.NonStreamResponse(w, ccResp, requestID, ccBody.Params.Model, created)
+		p.nonStreamPassThrough(w, ccResp, openAIReq.Model)
 	}
 }
 
-// StreamResponse handles streaming response from CommandCode to OpenAI SSE
-func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64) {
+// callUpstreamWithRetry posts to the provider endpoint; on 429 it marks the key,
+// then retries once with the next available key.
+func (p *Proxy) callUpstreamWithRetry(ctx context.Context, body []byte, first *keypool.ApiKey) (*http.Response, *keypool.ApiKey, error) {
+	req, err := p.buildUpstreamRequest(ctx, body, first.Key)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := p.Client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("upstream error: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		return resp, first, nil
+	}
+
+	// mark first key, try next
+	errBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	p.Keys.MarkError(first.Key, fmt.Sprintf("429 rate limited: %s", truncateLog(string(errBody))))
+
+	next := p.Keys.GetNext()
+	if next == nil || next.Key == first.Key {
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(bytes.NewReader(errBody))}, first, nil
+	}
+	p.debugf("[DEBUG] key %s 429, retrying with %s", first.Name, next.Name)
+	req2, err := p.buildUpstreamRequest(ctx, body, next.Key)
+	if err != nil {
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(bytes.NewReader(errBody))}, first, nil
+	}
+	resp2, err := p.Client.Do(req2)
+	if err != nil {
+		return nil, nil, fmt.Errorf("upstream error: %w", err)
+	}
+	return resp2, next, nil
+}
+
+func (p *Proxy) buildUpstreamRequest(ctx context.Context, body []byte, apiKey string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.upstreamURL(), bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create upstream request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("User-Agent", "ccproxy/2.0")
+	return req, nil
+}
+
+// streamPassThrough relays SSE chunks verbatim, mapping upstream `reasoning`
+// deltas to `reasoning_content` for broader client compatibility.
+func (p *Proxy) streamPassThrough(w http.ResponseWriter, r *http.Request, upResp *http.Response, clientModel string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
 		return
 	}
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	scanner := bufio.NewScanner(ccResp.Body)
+	scanner := bufio.NewScanner(upResp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	sentRole := false
-	toolCallIndex := 0
-	toolCallIndexes := map[string]int{}
 
 	for scanner.Scan() {
 		select {
@@ -273,334 +240,101 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			return
 		default:
 		}
-
-		line := strings.TrimSpace(scanner.Text())
+		line := scanner.Text()
 		if line == "" {
 			continue
 		}
-		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
-
-		var event api.CCStreamEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
-		}
-
-		switch event.Type {
-		case "text-delta":
-			delta := api.OpenAIDelta{Content: event.Text}
-			if !sentRole {
-				delta.Role = "assistant"
-				sentRole = true
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-			})
-
-		case "thinking-delta", "reasoning-delta":
-			delta := api.OpenAIDelta{ReasoningContent: event.Text}
-			if !sentRole {
-				delta.Role = "assistant"
-				sentRole = true
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-			})
-
-		case "tool-use":
-			toolCalls := []api.OpenAIDeltaToolCall{{
-				Index:    toolCallIndex,
-				ID:       event.ToolCallID,
-				Type:     "function",
-				Function: &api.OpenAIDeltaFunction{Name: event.ToolName},
-			}}
-			delta := api.OpenAIDelta{ToolCalls: toolCalls}
-			if !sentRole {
-				delta.Role = "assistant"
-				sentRole = true
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-			})
-			toolCallIndex++
-
-		case "tool-delta":
-			toolCalls := []api.OpenAIDeltaToolCall{{
-				Index:    toolCallIndex - 1,
-				Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
-			}}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: toolCalls}}},
-			})
-
-		case "tool-input-start":
-			if _, ok := toolCallIndexes[event.ID]; !ok {
-				toolCallIndexes[event.ID] = toolCallIndex
-				toolCallIndex++
-			}
-			delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-				Index: toolCallIndexes[event.ID],
-				ID:    event.ID,
-				Type:  "function",
-				Function: &api.OpenAIDeltaFunction{
-					Name: event.ToolName,
-				},
-			}}}
-			if !sentRole {
-				delta.Role = "assistant"
-				sentRole = true
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-			})
-
-		case "tool-input-delta":
-			idx, ok := toolCallIndexes[event.ID]
-			if !ok {
-				idx = toolCallIndex
-				toolCallIndexes[event.ID] = idx
-				toolCallIndex++
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-					Index:    idx,
-					Function: &api.OpenAIDeltaFunction{Arguments: event.Delta},
-				}}}}},
-			})
-
-		case "tool-call":
-			if _, alreadyStreamed := toolCallIndexes[event.ToolCallID]; alreadyStreamed {
-				continue
-			}
-			idx := toolCallIndex
-			toolCallIndexes[event.ToolCallID] = idx
-			toolCallIndex++
-			args := ""
-			if event.Input != nil {
-				if data, err := json.Marshal(event.Input); err == nil {
-					args = string(data)
-				}
-			}
-			delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
-				Index: idx,
-				ID:    event.ToolCallID,
-				Type:  "function",
-				Function: &api.OpenAIDeltaFunction{
-					Name:      event.ToolName,
-					Arguments: args,
-				},
-			}}}
-			if !sentRole {
-				delta.Role = "assistant"
-				sentRole = true
-			}
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
-			})
-
-		case "finish":
-			reason := normalizeFinishReason(event.FinishReason)
-			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []api.OpenAIChoice{{
-					Index:        0,
-					Delta:        &api.OpenAIDelta{},
-					FinishReason: &reason,
-				}},
-			})
-			fmt.Fprintf(w, "data: [DONE]\n\n")
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "data:") || strings.Contains(trimmed, "[DONE]") {
+			// meta/comment lines pass through as-is
+			fmt.Fprintln(w, line)
 			flusher.Flush()
-
-		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
-		}
-	}
-
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		log.Printf("[ERROR] Scanner error: %v", err)
-	}
-}
-
-// WriteSSE writes a Server-Sent Event
-func (p *Proxy) WriteSSE(w io.Writer, flusher http.Flusher, resp api.OpenAIChatResponse) {
-	data, _ := json.Marshal(resp)
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
-}
-
-// NonStreamResponse handles non-streaming response
-func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64) {
-	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
-	var content strings.Builder
-	var thinking strings.Builder
-	var hasThinking bool
-	var inputTokens, outputTokens, cachedInputTokens, reasoningTokens int
-	var hasToolCalls bool
-	var toolCalls []api.ToolCall
-	toolCallByID := map[string]int{}
-	toolInputBuffers := map[string]*strings.Builder{}
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		p.debugf("[DEBUG] CommandCode stream line: %s", truncateLog(line))
-
-		var event api.CCStreamEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			continue
 		}
 
-		switch event.Type {
-		case "text-delta":
-			content.WriteString(event.Text)
-		case "thinking-delta", "reasoning-delta":
-			hasThinking = true
-			thinking.WriteString(event.Text)
-		case "tool-use":
-			hasToolCalls = true
-			toolCallByID[event.ToolCallID] = len(toolCalls)
-			toolCalls = append(toolCalls, api.ToolCall{
-				ID:   event.ToolCallID,
-				Type: "function",
-				Function: api.FunctionCall{
-					Name:      event.ToolName,
-					Arguments: "",
-				},
-			})
-		case "tool-delta":
-			if len(toolCalls) > 0 {
-				toolCalls[len(toolCalls)-1].Function.Arguments += event.Text
-			}
-		case "tool-input-start":
-			hasToolCalls = true
-			toolCallByID[event.ID] = len(toolCalls)
-			toolInputBuffers[event.ID] = &strings.Builder{}
-			toolCalls = append(toolCalls, api.ToolCall{
-				ID:   event.ID,
-				Type: "function",
-				Function: api.FunctionCall{
-					Name:      event.ToolName,
-					Arguments: "",
-				},
-			})
-		case "tool-input-delta":
-			if b := toolInputBuffers[event.ID]; b != nil {
-				b.WriteString(event.Delta)
-			}
-			if idx, ok := toolCallByID[event.ID]; ok {
-				toolCalls[idx].Function.Arguments += event.Delta
-			}
-		case "tool-call":
-			hasToolCalls = true
-			args := ""
-			if event.Input != nil {
-				if data, err := json.Marshal(event.Input); err == nil {
-					args = string(data)
-				}
-			}
-			if idx, ok := toolCallByID[event.ToolCallID]; ok {
-				toolCalls[idx].Function.Name = event.ToolName
-				if args != "" {
-					toolCalls[idx].Function.Arguments = args
-				}
-			} else {
-				toolCallByID[event.ToolCallID] = len(toolCalls)
-				toolCalls = append(toolCalls, api.ToolCall{
-					ID:   event.ToolCallID,
-					Type: "function",
-					Function: api.FunctionCall{
-						Name:      event.ToolName,
-						Arguments: args,
-					},
-				})
-			}
-		case "finish":
-			if event.TotalUsage != nil {
-				inputTokens = event.TotalUsage.InputTokens
-				outputTokens = event.TotalUsage.OutputTokens
-				cachedInputTokens = event.TotalUsage.CachedInputTokens
-				reasoningTokens = event.TotalUsage.ReasoningTokens
-			}
-		case "error":
-			log.Printf("[ERROR] Stream error: %v", event.Error)
+		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			fmt.Fprintln(w, line)
+			flusher.Flush()
+			continue
 		}
+
+		// map delta.reasoning -> delta.reasoning_content
+		if clientModel != "" {
+			chunk["model"] = clientModel
+		}
+		if choices, ok := chunk["choices"].([]any); ok {
+			for _, c := range choices {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				delta, ok := cm["delta"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if reasoning, ok := delta["reasoning"]; ok {
+					if _, exists := delta["reasoning_content"]; !exists {
+						delta["reasoning_content"] = reasoning
+					}
+				}
+				// also handle reasoning_details -> keep as-is (already present)
+			}
+		}
+
+		out, err := json.Marshal(chunk)
+		if err != nil {
+			fmt.Fprintln(w, line)
+			flusher.Flush()
+			continue
+		}
+		fmt.Fprintf(w, "data: %s\n\n", out)
+		flusher.Flush()
+	}
+}
+
+// nonStreamPassThrough relays the JSON body, mapping message.reasoning to reasoning_content
+func (p *Proxy) nonStreamPassThrough(w http.ResponseWriter, upResp *http.Response, clientModel string) {
+	body, err := io.ReadAll(upResp.Body)
+	if err != nil {
+		p.writeOpenAIError(w, http.StatusBadGateway, "failed to read upstream", "api_error")
+		return
 	}
 
-	msg := &api.OpenAIMessage{
-		Role:    "assistant",
-		Content: content.String(),
-	}
-	if hasThinking {
-		msg.ReasoningContent = thinking.String()
-	}
-	finishReason := "stop"
-	if hasToolCalls {
-		msg.Content = nil
-		msg.ToolCalls = toolCalls
-		finishReason = "tool_calls"
-	}
-
-	response := api.OpenAIChatResponse{
-		ID:      requestID,
-		Object:  "chat.completion",
-		Created: created,
-		Model:   model,
-		Choices: []api.OpenAIChoice{{
-			Index:        0,
-			Message:      msg,
-			FinishReason: &finishReason,
-		}},
-		Usage: &api.OpenAIUsage{
-			PromptTokens:     inputTokens,
-			CompletionTokens: outputTokens,
-			TotalTokens:      inputTokens + outputTokens,
-			PromptTokensDetails: &api.OpenAIUsagePromptDetails{
-				CachedTokens: cachedInputTokens,
-			},
-			CompletionTokensDetails: &api.OpenAIUsageCompDetails{
-				ReasoningTokens: reasoningTokens,
-			},
-		},
+	var resp map[string]any
+	if json.Unmarshal(body, &resp) == nil {
+		if clientModel != "" {
+			resp["model"] = clientModel
+		}
+		if choices, ok := resp["choices"].([]any); ok {
+			for _, c := range choices {
+				cm, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				msg, ok := cm["message"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if reasoning, ok := msg["reasoning"]; ok {
+					if _, exists := msg["reasoning_content"]; !exists {
+						msg["reasoning_content"] = reasoning
+					}
+				}
+			}
+			if out, err := json.Marshal(resp); err == nil {
+				body = out
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	w.WriteHeader(upResp.StatusCode)
+	w.Write(body)
 }
 
+// HandleResponses converts an OpenAI Responses-API request to chat format and proxies it
 func (p *Proxy) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		p.writeOpenAIError(w, http.StatusMethodNotAllowed, "Method not allowed", "invalid_request_error")
@@ -612,7 +346,6 @@ func (p *Proxy) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		p.writeOpenAIError(w, http.StatusBadRequest, "Failed to read body", "invalid_request_error")
 		return
 	}
-
 	p.debugf("[DEBUG] Client responses request body: %s", truncateLog(string(body)))
 
 	var responsesReq api.OpenAIResponsesRequest
@@ -703,44 +436,21 @@ func responseItemsToMessages(items []any) []api.OpenAIMessage {
 	return messages
 }
 
-// HandleModels handles the /v1/models endpoint
-// Only includes models available on the Go plan (Open Source category)
+// HandleModels returns the dynamic model list (short names for clients)
 func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
-	models := api.OpenAIModelList{
-		Object: "list",
-		Data: []api.OpenAIModel{
-			// DeepSeek
-			{ID: "deepseek-v4-pro", Object: "model", Created: 0, OwnedBy: "deepseek"},
-			{ID: "deepseek-v4-flash", Object: "model", Created: 0, OwnedBy: "deepseek"},
-			// Kimi (MoonshotAI)
-			{ID: "kimi-k2.7-code", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			{ID: "kimi-k2.7-code-highspeed", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			{ID: "kimi-k2.6", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			{ID: "kimi-k2.5", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			// ZhipuAI (GLM)
-			{ID: "glm-5.2", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			{ID: "glm-5.2-fast", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			{ID: "glm-5.1", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			{ID: "glm-5", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			// MiniMax
-			{ID: "minimax-m3", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			{ID: "minimax-m2.7", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			{ID: "minimax-m2.5", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			// Xiaomi (MiMo)
-			{ID: "mimo-v2.5-pro", Object: "model", Created: 0, OwnedBy: "xiaomi"},
-			{ID: "mimo-v2.5", Object: "model", Created: 0, OwnedBy: "xiaomi"},
-			// Qwen
-			{ID: "qwen-3.7-max", Object: "model", Created: 0, OwnedBy: "qwen"},
-			{ID: "qwen-3.7-plus", Object: "model", Created: 0, OwnedBy: "qwen"},
-			{ID: "qwen-3.6-max-preview", Object: "model", Created: 0, OwnedBy: "qwen"},
-			{ID: "qwen-3.6-plus", Object: "model", Created: 0, OwnedBy: "qwen"},
-			// StepFun
-			{ID: "step-3.7-flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-			{ID: "step-3.5-flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-			// NVIDIA
-			{ID: "nemotron-3-ultra", Object: "model", Created: 0, OwnedBy: "nvidia"},
-		},
+	entries := p.Models.List()
+	data := make([]api.OpenAIModel, 0, len(entries))
+	for _, e := range entries {
+		data = append(data, api.OpenAIModel{
+			ID:      e.ShortName,
+			Object:  "model",
+			Created: 0,
+			OwnedBy: e.Vendor,
+		})
 	}
+	models := api.OpenAIModelList{Object: "list", Data: data}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(models)
 }
+
+var _ = uuid.New // keep uuid import for future use

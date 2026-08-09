@@ -2,6 +2,8 @@
 bin/
 *.exe
 
+data/
+
 # Runtime data
 logs/
 proxy.pid
