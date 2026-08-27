@@ -11,6 +11,22 @@ npm run dev
 
 The default listener is `127.0.0.1:3000`.
 
+### Background Service
+
+Build and start the proxy in the background:
+
+```bash
+./start.sh
+```
+
+Stop the process started by the script:
+
+```bash
+./stop.sh
+```
+
+The service PID is stored in `.ai-cmd-proxy.pid` and output is written to `.ai-cmd-proxy.log`.
+
 ## Authentication
 
 Pass the CommandCode API key per request using the normal OpenAI header:

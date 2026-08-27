@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 coverage/
+.ai-cmd-proxy.pid
+.ai-cmd-proxy.log
