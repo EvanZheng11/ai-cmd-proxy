@@ -1,7 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import type { CommandCodeClient } from "../src/commandcode/client.js";
+import {
+  createCommandCodeClient,
+  type CommandCodeClient,
+} from "../src/commandcode/client.js";
 import type { CommandCodeEvent } from "../src/commandcode/types.js";
+import { loadConfig } from "../src/config.js";
 import { buildServer } from "../src/server.js";
 import { toChatRequestFromResponses } from "../src/translate/responses.js";
 
@@ -202,5 +206,61 @@ describe("POST /v1/responses", () => {
     expect(response.json()).toMatchObject({
       error: { type: "api_error", code: "upstream_error" },
     });
+  });
+
+  it("preserves an upstream HTTP error before starting a Responses stream", async () => {
+    const client = createCommandCodeClient({
+      config: loadConfig({}),
+      fetch: vi.fn().mockResolvedValue(new Response("invalid request", { status: 400 })),
+      createTempDir: vi.fn().mockResolvedValue("/tmp/ai-cmd-proxy-test"),
+      removeTempDir: vi.fn().mockResolvedValue(undefined),
+    });
+    const response = await buildServer({
+      commandCodeClient: client,
+    }).inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        input: "Hi",
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { type: "api_error", code: "upstream_error" },
+    });
+  });
+
+  it("cleans up the upstream client when the first streamed event is an error", async () => {
+    const removeTempDir = vi.fn().mockResolvedValue(undefined);
+    const app = buildServer({
+      commandCodeClient: createCommandCodeClient({
+        config: loadConfig({}),
+        fetch: vi.fn().mockResolvedValue(new Response(
+          '{"type":"error","error":"provider failed","statusCode":502}\n',
+          { status: 200 },
+        )),
+        createTempDir: vi.fn().mockResolvedValue("/tmp/ai-cmd-proxy-test"),
+        removeTempDir,
+      }),
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        input: "Hi",
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('event: error');
+    expect(removeTempDir).toHaveBeenCalledWith("/tmp/ai-cmd-proxy-test");
   });
 });

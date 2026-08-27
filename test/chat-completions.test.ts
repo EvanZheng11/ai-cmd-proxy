@@ -77,6 +77,30 @@ describe("POST /v1/chat/completions", () => {
     expect(response.body.match(/data: \[DONE\]/g)).toHaveLength(1);
   });
 
+  it("preserves an upstream HTTP error before starting a Chat Completions stream", async () => {
+    const response = await buildServer({
+      commandCodeClient: {
+        async *stream() {
+          throw new CommandCodeUpstreamError("CommandCode returned HTTP 400", 400);
+        },
+      },
+    }).inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        messages: [{ role: "user", content: "Hi" }],
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { type: "api_error", code: "upstream_error" },
+    });
+  });
+
   it("rejects requests without a credential", async () => {
     const response = await buildServer({
       commandCodeClient: fakeClient([]),

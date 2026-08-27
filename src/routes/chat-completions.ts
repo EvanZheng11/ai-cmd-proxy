@@ -56,6 +56,28 @@ export async function registerChatCompletions(
       });
 
       if (body.stream) {
+        // Read the first upstream result before committing the HTTP status.
+        // A rejected iterator means CommandCode returned an HTTP/transport error.
+        const iterator = events[Symbol.asyncIterator]();
+        const first = await iterator.next();
+        const bufferedEvents = (async function* () {
+          try {
+            if (first.done) {
+              return;
+            }
+            yield first.value;
+            while (true) {
+              const next = await iterator.next();
+              if (next.done) {
+                return;
+              }
+              yield next.value;
+            }
+          } finally {
+            await iterator.return?.();
+          }
+        })();
+
         reply.hijack();
         reply.raw.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
@@ -64,7 +86,7 @@ export async function registerChatCompletions(
         });
 
         try {
-          for await (const chunk of toChatCompletionChunks(events, body)) {
+          for await (const chunk of toChatCompletionChunks(bufferedEvents, body)) {
             reply.raw.write(chunk);
           }
         } catch (error) {
