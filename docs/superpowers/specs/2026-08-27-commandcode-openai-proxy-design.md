@@ -73,7 +73,7 @@ Every `/alpha/generate` request includes the required configuration shape:
 
 ```json
 {
-  "workingDir": "/Users/andyzheng",
+  "workingDir": "/tmp/ai-cmd-proxy-a1b2c3",
   "date": "2026-08-27",
   "environment": "darwin",
   "structure": [],
@@ -85,7 +85,7 @@ Every `/alpha/generate` request includes the required configuration shape:
 }
 ```
 
-The values are configurable through environment variables. The default working directory is `/Users/andyzheng`, and the default date is generated at request time.
+Before each upstream request, the proxy creates a unique temporary working directory using the operating system temporary directory and a random suffix, for example `/tmp/ai-cmd-proxy-a1b2c3`. The directory is empty unless the request contains data that must be staged locally. It is removed after the upstream stream finishes or fails. The date is generated at request time, and the environment value comes from the running process.
 
 ### Chat Completions
 
