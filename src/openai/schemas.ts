@@ -64,3 +64,30 @@ export const chatCompletionRequestSchema = z.object({
 export function parseChatCompletionRequest(input: unknown) {
   return chatCompletionRequestSchema.parse(input);
 }
+
+export const responsesRequestSchema = z.object({
+  model: z.string().min(1),
+  input: z.union([
+    z.string(),
+    z.array(messageSchema),
+    z.array(contentPartSchema),
+    z.array(z.unknown()),
+  ]),
+  instructions: z.string().optional(),
+  stream: z.boolean().optional(),
+  max_output_tokens: z.number().int().positive().optional(),
+  temperature: z.number().min(0).optional(),
+  top_p: z.number().min(0).max(1).optional(),
+  reasoning: z.object({
+    effort: z.string().optional(),
+  }).optional(),
+  tools: z.array(toolSchema).optional(),
+  text: z.object({
+    format: z.record(z.string(), z.unknown()).optional(),
+  }).optional(),
+  previous_response_id: z.string().optional(),
+}).passthrough();
+
+export function parseResponsesRequest(input: unknown) {
+  return responsesRequestSchema.parse(input);
+}

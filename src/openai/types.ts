@@ -57,7 +57,7 @@ export type ChatCompletionRequest = {
 
 export type ResponsesRequest = {
   model: string;
-  input: string | OpenAiChatMessage[] | OpenAiContentPart[];
+  input: string | OpenAiChatMessage[] | OpenAiContentPart[] | unknown[];
   instructions?: string;
   stream?: boolean;
   max_output_tokens?: number;

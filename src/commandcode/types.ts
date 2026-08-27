@@ -7,6 +7,18 @@ export type CommandCodeContentBlock =
       type: "image";
       media_type: string;
       data: string;
+    }
+  | {
+      type: "tool-call";
+      toolCallId: string;
+      toolName: string;
+      input: unknown;
+    }
+  | {
+      type: "tool-result";
+      toolCallId: string;
+      toolName: string;
+      output: unknown;
     };
 
 export type CommandCodeMessage = {
