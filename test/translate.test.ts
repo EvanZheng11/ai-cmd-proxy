@@ -92,6 +92,18 @@ describe("OpenAI request translation", () => {
     expect(result.params.max_tokens).toBe(777);
   });
 
+  it("rejects tool selection controls that CommandCode cannot represent", () => {
+    expect(() => toCommandCodeGenerateRequest({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{ role: "user", content: "Use tools" }],
+      tools: [{
+        type: "function",
+        function: { name: "lookup", parameters: { type: "object" } },
+      }],
+      tool_choice: "required",
+    })).toThrow("tool_choice");
+  });
+
   it("preserves assistant tool calls and tool results", () => {
     const result = toCommandCodeGenerateRequest({
       model: "deepseek/deepseek-v4-flash",
@@ -149,11 +161,55 @@ describe("OpenAI request translation", () => {
         role: "user",
         content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }],
       }],
-    }, fetchMock);
+    }, fetchMock, {
+      resolveHost: async () => [{ address: "93.184.216.34", family: 4 }],
+    });
 
     expect(result.messages[0]?.content).toEqual([{
       type: "image_url",
       image_url: { url: "data:image/png;base64,AQID" },
     }]);
+  });
+
+  it("rejects private IPv6 and DNS-resolved private image targets", async () => {
+    const fetchMock = vi.fn();
+    await expect(materializeRemoteImages({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "https://[fd00::1]/a.png" } }],
+      }],
+    }, fetchMock)).rejects.toThrow("public HTTP(S)");
+
+    await expect(materializeRemoteImages({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }],
+      }],
+    }, fetchMock, {
+      resolveHost: async () => [{ address: "127.0.0.1", family: 4 }],
+    })).rejects.toThrow("public HTTP(S)");
+  });
+
+  it("rejects image responses over the configured byte limit", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "content-length": "4",
+        },
+      }),
+    );
+
+    await expect(materializeRemoteImages({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }],
+      }],
+    }, fetchMock, { maxBytes: 3, resolveHost: async () => [{ address: "93.184.216.34", family: 4 }] }))
+      .rejects.toThrow("too large");
   });
 });

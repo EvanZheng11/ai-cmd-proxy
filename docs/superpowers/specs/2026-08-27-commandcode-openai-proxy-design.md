@@ -17,7 +17,7 @@ The first implementation supports:
 - Text messages and public image URLs or base64 data URLs
 - Tool definitions, tool calls, and tool results
 - Structured output requests where they can be represented by the CommandCode prompt contract
-- `model`, `max_tokens`, `max_completion_tokens`, `reasoning_effort`, `temperature`, `top_p`, `stop`, `tool_choice`, `parallel_tool_calls`, and `stream_options.include_usage`
+- `model`, `max_tokens`, `max_completion_tokens`, `reasoning_effort`, `temperature`, `top_p`, `stop`, and `stream_options.include_usage`
 - OpenAI-compatible JSON responses and Server-Sent Events
 
 The service does not claim to implement upstream capabilities that CommandCode cannot execute. Audio, embeddings, image generation, file management, batch jobs, and moderation return a standard OpenAI-shaped `501` or `400` error with a stable error code.
@@ -164,7 +164,7 @@ CommandCode `tool-call` events become OpenAI tool calls. Tool results from a fol
 
 ## Structured Output
 
-`response_format` with `json_object` or `json_schema` is translated into an explicit system constraint and retained in the response metadata. The adapter validates JSON object output when possible and returns a standard `422` error when the upstream output cannot satisfy the requested JSON form.
+`response_format` with `json_object` or `json_schema` is translated into an explicit system constraint. Tool selection controls that CommandCode cannot express (`tool_choice` and `parallel_tool_calls`) return a standard `400` error rather than being silently ignored. Responses `previous_response_id` returns `400` until a state store is enabled.
 
 ## Errors and Limits
 

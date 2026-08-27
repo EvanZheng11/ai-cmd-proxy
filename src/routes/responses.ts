@@ -7,9 +7,10 @@ import {
   type CommandCodeClient,
 } from "../commandcode/client.js";
 import type { ProxyConfig } from "../config.js";
-import { openAiError, upstreamOpenAiError } from "../errors.js";
+import { openAiError, upstreamOpenAiError, UpstreamStreamError } from "../errors.js";
 import { toCommandCodeGenerateRequest } from "../translate/generate-request.js";
 import { toChatRequestFromResponses, toResponse, toResponseEvents } from "../translate/responses.js";
+import { parseResponsesRequest } from "../openai/schemas.js";
 import { materializeRemoteImages } from "../translate/messages.js";
 
 type ResponsesRouteDependencies = {
@@ -35,6 +36,15 @@ export async function registerResponses(
     }
 
     try {
+      const rawBody = parseResponsesRequest(request.body);
+      if (rawBody.previous_response_id) {
+        return sendError(
+          reply,
+          400,
+          "previous_response_id requires a stateful response store",
+          "previous_response_id_unsupported",
+        );
+      }
       const body = await materializeRemoteImages(toChatRequestFromResponses(request.body));
       const original = request.body as { stream?: boolean };
       const events = dependencies.commandCodeClient.stream({
@@ -55,6 +65,13 @@ export async function registerResponses(
           for await (const chunk of toResponseEvents(events, body.model)) {
             reply.raw.write(chunk);
           }
+        } catch (error) {
+          if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
+            const mapped = upstreamOpenAiError(error.status);
+            reply.raw.write(`event: error\ndata: ${JSON.stringify(mapped.body)}\n\n`);
+          } else {
+            throw error;
+          }
         } finally {
           reply.raw.end();
         }
@@ -68,6 +85,10 @@ export async function registerResponses(
       return reply.send(toResponse(collected, body.model));
     } catch (error) {
       if (error instanceof CommandCodeUpstreamError) {
+        const mapped = upstreamOpenAiError(error.status);
+        return reply.code(mapped.status).send(mapped.body);
+      }
+      if (error instanceof UpstreamStreamError) {
         const mapped = upstreamOpenAiError(error.status);
         return reply.code(mapped.status).send(mapped.body);
       }

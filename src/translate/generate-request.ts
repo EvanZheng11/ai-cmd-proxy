@@ -25,6 +25,12 @@ export function toCommandCodeGenerateRequest(
   options: { defaultMaxTokens?: number } = {},
 ): CommandCodeGenerateInput {
   const request = parseChatCompletionRequest(input);
+  if (request.tool_choice !== undefined) {
+    throw new Error("tool_choice cannot be represented by CommandCode");
+  }
+  if (request.parallel_tool_calls !== undefined) {
+    throw new Error("parallel_tool_calls cannot be represented by CommandCode");
+  }
   const { messages, system } = toCommandCodeMessages(request.messages);
   const structuredInstruction = structuredOutputInstruction(request);
   const maxTokens = request.max_completion_tokens

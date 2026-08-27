@@ -19,7 +19,7 @@ Pass the CommandCode API key per request using the normal OpenAI header:
 Authorization: Bearer <CommandCode API key>
 ```
 
-The proxy forwards the credential only for the active upstream request. It does not persist or log the key.
+The proxy forwards the credential only for the active upstream request. It does not persist or log the key. Remote image URLs are resolved only when they are public HTTP(S) resources, are not redirected, and are capped at 10 MiB.
 
 ## Chat Completions
 
@@ -46,7 +46,7 @@ Use `POST /v1/responses` with `model`, `input`, optional `instructions`, `tools`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 
-Unsupported OpenAI API groups return an OpenAI-shaped `501` response.
+Unsupported OpenAI API groups return an OpenAI-shaped `501` response. OpenAI tool-selection controls that CommandCode cannot represent return `400` instead of being ignored.
 
 ## Configuration
 

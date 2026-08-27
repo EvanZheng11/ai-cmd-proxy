@@ -19,6 +19,16 @@ export type OpenAiErrorOptions = {
   code?: string | null;
 };
 
+export class UpstreamStreamError extends Error {
+  constructor(
+    message: string,
+    readonly status = 502,
+  ) {
+    super(message);
+    this.name = "UpstreamStreamError";
+  }
+}
+
 export function openAiError(
   _status: number,
   message: string,

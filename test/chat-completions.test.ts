@@ -72,6 +72,7 @@ describe("POST /v1/chat/completions", () => {
     expect(response.headers["content-type"]).toContain("text/event-stream");
     expect(response.body).toContain('"content":"TEST_OK"');
     expect(response.body).toContain("data: [DONE]");
+    expect(response.body.match(/data: \[DONE\]/g)).toHaveLength(1);
   });
 
   it("rejects requests without a credential", async () => {
@@ -112,6 +113,46 @@ describe("POST /v1/chat/completions", () => {
     expect(response.statusCode).toBe(401);
     expect(response.json()).toMatchObject({
       error: { type: "authentication_error", code: "upstream_authentication" },
+    });
+  });
+
+  it("maps an upstream stream error instead of returning a successful completion", async () => {
+    const response = await buildServer({
+      commandCodeClient: fakeClient([
+        { type: "error", error: "provider failed", statusCode: 502 },
+      ]),
+    }).inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        messages: [{ role: "user", content: "Hi" }],
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { type: "api_error", code: "upstream_error" },
+    });
+  });
+
+  it("returns an OpenAI error for malformed JSON", async () => {
+    const response = await buildServer({
+      commandCodeClient: fakeClient([]),
+    }).inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: {
+        authorization: "Bearer request-key",
+        "content-type": "application/json",
+      },
+      payload: "{\"model\":",
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: { type: "invalid_request_error" },
     });
   });
 });

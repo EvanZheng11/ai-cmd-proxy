@@ -82,14 +82,22 @@ async function* readNdjson(response: Response): AsyncIterable<CommandCodeEvent> 
       for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed) {
-          yield JSON.parse(trimmed) as CommandCodeEvent;
+          try {
+            yield JSON.parse(trimmed) as CommandCodeEvent;
+          } catch {
+            throw new CommandCodeUpstreamError("CommandCode returned malformed NDJSON", 502);
+          }
         }
       }
     }
 
     const trailing = `${buffered}${decoder.decode()}`.trim();
     if (trailing) {
-      yield JSON.parse(trailing) as CommandCodeEvent;
+      try {
+        yield JSON.parse(trailing) as CommandCodeEvent;
+      } catch {
+        throw new CommandCodeUpstreamError("CommandCode returned malformed NDJSON", 502);
+      }
     }
   } finally {
     reader.releaseLock();
@@ -145,6 +153,16 @@ export function createCommandCodeClient(dependencies: ClientDependencies): Comma
         }
 
         yield* readNdjson(response);
+      } catch (error) {
+        if (error instanceof CommandCodeUpstreamError) {
+          throw error;
+        }
+        const errorName = error instanceof Error ? error.name : "";
+        const isTimeout = errorName === "TimeoutError" || errorName === "AbortError";
+        throw new CommandCodeUpstreamError(
+          isTimeout ? "CommandCode request timed out" : "CommandCode request failed",
+          isTimeout ? 504 : 502,
+        );
       } finally {
         await removeTempDir(workingDir);
       }

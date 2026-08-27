@@ -116,4 +116,38 @@ describe("CommandCode client", () => {
     expect(createTempDir).toHaveBeenCalledOnce();
     expect(removeTempDir).toHaveBeenCalledWith("/tmp/ai-cmd-proxy-random");
   });
+
+  it("maps malformed NDJSON to an upstream error", async () => {
+    const client = createCommandCodeClient({
+      config: loadConfig({}),
+      fetch: vi.fn().mockResolvedValue(new Response("not-json\n", { status: 200 })),
+      createTempDir: vi.fn().mockResolvedValue("/tmp/ai-cmd-proxy-random"),
+      removeTempDir: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(collect(client.stream({
+      apiKey: "request-secret",
+      request: sampleRequest,
+    }))).rejects.toMatchObject({
+      name: "CommandCodeUpstreamError",
+      status: 502,
+    });
+  });
+
+  it("maps an upstream timeout to status 504", async () => {
+    const client = createCommandCodeClient({
+      config: loadConfig({}),
+      fetch: vi.fn().mockRejectedValue(new DOMException("Timed out", "TimeoutError")),
+      createTempDir: vi.fn().mockResolvedValue("/tmp/ai-cmd-proxy-random"),
+      removeTempDir: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(collect(client.stream({
+      apiKey: "request-secret",
+      request: sampleRequest,
+    }))).rejects.toMatchObject({
+      name: "CommandCodeUpstreamError",
+      status: 504,
+    });
+  });
 });

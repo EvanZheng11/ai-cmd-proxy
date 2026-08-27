@@ -35,6 +35,51 @@ describe("POST /v1/responses", () => {
     });
   });
 
+  it("normalizes flat Responses function tools", () => {
+    const result = toChatRequestFromResponses({
+      model: "deepseek/deepseek-v4-flash",
+      input: "Use the tool",
+      tools: [{
+        type: "function",
+        name: "lookup",
+        description: "Find a record",
+        parameters: { type: "object", properties: { id: { type: "string" } } },
+      }],
+    });
+
+    expect(result.tools).toEqual([{
+      type: "function",
+      function: {
+        name: "lookup",
+        description: "Find a record",
+        parameters: { type: "object", properties: { id: { type: "string" } } },
+      },
+    }]);
+  });
+
+  it("maps Responses text.format to a structured output request", () => {
+    const result = toChatRequestFromResponses({
+      model: "deepseek/deepseek-v4-flash",
+      input: "Return JSON",
+      text: {
+        format: {
+          type: "json_schema",
+          name: "answer",
+          schema: { type: "object", properties: { value: { type: "string" } } },
+        },
+      },
+    });
+
+    expect(result.response_format).toEqual({
+      type: "json_schema",
+      json_schema: {
+        type: "json_schema",
+        name: "answer",
+        schema: { type: "object", properties: { value: { type: "string" } } },
+      },
+    });
+  });
+
   it("returns a Responses API output item", async () => {
     const response = await buildServer({
       commandCodeClient: fakeClient([
@@ -62,6 +107,38 @@ describe("POST /v1/responses", () => {
     });
   });
 
+  it("returns function_call output for an upstream tool call", async () => {
+    const response = await buildServer({
+      commandCodeClient: fakeClient([
+        {
+          type: "tool-call",
+          toolCallId: "call_1",
+          toolName: "lookup",
+          input: { id: "7" },
+        },
+        { type: "finish", finishReason: "tool-calls" },
+      ]),
+    }).inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        input: "Use lookup",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      output: [{
+        type: "function_call",
+        call_id: "call_1",
+        name: "lookup",
+        arguments: "{\"id\":\"7\"}",
+      }],
+    });
+  });
+
   it("streams Responses lifecycle events", async () => {
     const response = await buildServer({
       commandCodeClient: fakeClient([
@@ -84,5 +161,46 @@ describe("POST /v1/responses", () => {
     expect(response.body).toContain("response.created");
     expect(response.body).toContain("response.output_text.delta");
     expect(response.body).toContain("response.completed");
+  });
+
+  it("rejects previous_response_id while the proxy is stateless", async () => {
+    const response = await buildServer({
+      commandCodeClient: fakeClient([]),
+    }).inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        input: "Hi",
+        previous_response_id: "resp_previous",
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: { code: "previous_response_id_unsupported" },
+    });
+  });
+
+  it("maps upstream stream errors to a non-success response", async () => {
+    const response = await buildServer({
+      commandCodeClient: fakeClient([
+        { type: "error", error: "provider failed", statusCode: 502 },
+      ]),
+    }).inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        input: "Hi",
+      },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { type: "api_error", code: "upstream_error" },
+    });
   });
 });

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { ChatCompletionRequest } from "../openai/types.js";
 import type { CommandCodeEvent } from "../commandcode/types.js";
+import { UpstreamStreamError } from "../errors.js";
 
 type Usage = {
   prompt_tokens: number;
@@ -51,7 +52,12 @@ export function aggregateChatEvents(events: CommandCodeEvent[]): ChatState {
   };
 
   for (const event of events) {
-    if (event.type === "text-delta") {
+    if (event.type === "error" || event.type === "abort") {
+      const message = typeof event.error === "string"
+        ? event.error
+        : event.error?.message ?? "CommandCode stream aborted";
+      throw new UpstreamStreamError(message, event.statusCode ?? 502);
+    } else if (event.type === "text-delta") {
       state.text += event.text ?? "";
     } else if (event.type === "tool-call") {
       state.toolCalls.push({
@@ -133,7 +139,12 @@ export async function* toChatCompletionChunks(
   });
 
   for await (const event of events) {
-    if (event.type === "text-delta" && event.text) {
+    if (event.type === "error" || event.type === "abort") {
+      const message = typeof event.error === "string"
+        ? event.error
+        : event.error?.message ?? "CommandCode stream aborted";
+      throw new UpstreamStreamError(message, event.statusCode ?? 502);
+    } else if (event.type === "text-delta" && event.text) {
       sawContent = true;
       yield emit({
         id,

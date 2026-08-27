@@ -3,10 +3,17 @@ import { randomUUID } from "node:crypto";
 import { parseResponsesRequest } from "../openai/schemas.js";
 import type { ChatCompletionRequest, ResponsesRequest } from "../openai/types.js";
 import type { CommandCodeEvent } from "../commandcode/types.js";
+import { UpstreamStreamError } from "../errors.js";
 import { toCommandCodeGenerateRequest } from "./generate-request.js";
 
 type ResponseState = {
   text: string;
+  reasoning: string;
+  toolCalls: Array<{
+    id: string;
+    name: string;
+    arguments: string;
+  }>;
   finishReason: string;
   usage?: {
     input_tokens: number;
@@ -70,7 +77,29 @@ export function toChatRequestFromResponses(input: unknown): ChatCompletionReques
     ...(request.reasoning?.effort === undefined
       ? {}
       : { reasoning_effort: request.reasoning.effort }),
-    ...(request.tools === undefined ? {} : { tools: request.tools }),
+    ...(request.tools === undefined
+      ? {}
+      : {
+          tools: request.tools.map((tool) => "function" in tool
+            ? tool
+            : {
+                type: "function" as const,
+                function: {
+                  name: tool.name,
+                  description: tool.description,
+                  parameters: tool.parameters,
+                  strict: tool.strict,
+                },
+              }),
+        }),
+    ...(request.text?.format === undefined
+      ? {}
+      : {
+          response_format: {
+            type: "json_schema" as const,
+            json_schema: request.text.format,
+          },
+        }),
   };
 }
 
@@ -95,10 +124,30 @@ function usageFromEvent(event: CommandCodeEvent) {
 }
 
 function collectState(events: CommandCodeEvent[]): ResponseState {
-  const state: ResponseState = { text: "", finishReason: "stop" };
+  const state: ResponseState = {
+    text: "",
+    reasoning: "",
+    toolCalls: [],
+    finishReason: "stop",
+  };
   for (const event of events) {
-    if (event.type === "text-delta") {
+    if (event.type === "error" || event.type === "abort") {
+      const message = typeof event.error === "string"
+        ? event.error
+        : event.error?.message ?? "CommandCode stream aborted";
+      throw new UpstreamStreamError(message, event.statusCode ?? 502);
+    } else if (event.type === "text-delta") {
       state.text += event.text ?? "";
+    } else if (event.type === "reasoning-delta") {
+      state.reasoning += event.text ?? "";
+    } else if (event.type === "tool-call") {
+      state.toolCalls.push({
+        id: event.toolCallId ?? `call_${randomUUID()}`,
+        name: event.toolName ?? "",
+        arguments: typeof event.input === "string"
+          ? event.input
+          : JSON.stringify(event.input ?? event.args ?? {}),
+      });
     } else if (event.type === "finish") {
       state.finishReason = event.finishReason ?? "stop";
       state.usage = usageFromEvent(event);
@@ -121,9 +170,17 @@ export function toResponse(events: CommandCodeEvent[], model: string) {
   const id = `resp_${randomUUID()}`;
   const state = collectState(events);
   const response = responseSkeleton(id, model);
-  return {
-    ...response,
-    output: [{
+  const output = [];
+  if (state.reasoning) {
+    output.push({
+      id: `rs_${randomUUID()}`,
+      type: "reasoning" as const,
+      status: "completed" as const,
+      summary: [{ type: "summary_text", text: state.reasoning }],
+    });
+  }
+  if (state.text || state.toolCalls.length === 0) {
+    output.push({
       id: `msg_${randomUUID()}`,
       type: "message" as const,
       status: "completed" as const,
@@ -133,7 +190,22 @@ export function toResponse(events: CommandCodeEvent[], model: string) {
         text: state.text,
         annotations: [],
       }],
-    }],
+    });
+  }
+  for (const call of state.toolCalls) {
+    output.push({
+      id: `fc_${randomUUID()}`,
+      type: "function_call" as const,
+      status: "completed" as const,
+      call_id: call.id,
+      name: call.name,
+      arguments: call.arguments,
+    });
+  }
+
+  return {
+    ...response,
+    output,
     ...(state.usage ? { usage: state.usage } : {}),
   };
 }
@@ -147,6 +219,7 @@ export async function* toResponseEvents(
   const created = Math.floor(Date.now() / 1000);
   let text = "";
   let usage: ResponseState["usage"];
+  let toolIndex = 0;
 
   const response = {
     ...responseSkeleton(id, model),
@@ -175,13 +248,65 @@ export async function* toResponseEvents(
   });
 
   for await (const event of events) {
-    if (event.type === "text-delta" && event.text) {
+    if (event.type === "error" || event.type === "abort") {
+      const message = typeof event.error === "string"
+        ? event.error
+        : event.error?.message ?? "CommandCode stream aborted";
+      throw new UpstreamStreamError(message, event.statusCode ?? 502);
+    } else if (event.type === "text-delta" && event.text) {
       text += event.text;
       yield emit("response.output_text.delta", {
         item_id: messageId,
         output_index: 0,
         content_index: 0,
         delta: event.text,
+      });
+    } else if (event.type === "reasoning-delta" && event.text) {
+      yield emit("response.reasoning_summary_text.delta", {
+        item_id: messageId,
+        output_index: 0,
+        summary_index: 0,
+        delta: event.text,
+      });
+    } else if (event.type === "tool-call") {
+      const callId = event.toolCallId ?? `call_${randomUUID()}`;
+      const name = event.toolName ?? "";
+      const args = typeof event.input === "string"
+        ? event.input
+        : JSON.stringify(event.input ?? event.args ?? {});
+      const outputIndex = toolIndex++;
+      const itemId = `fc_${randomUUID()}`;
+      yield emit("response.output_item.added", {
+        output_index: outputIndex,
+        item: {
+          id: itemId,
+          type: "function_call",
+          status: "in_progress",
+          call_id: callId,
+          name,
+          arguments: "",
+        },
+      });
+      yield emit("response.function_call_arguments.delta", {
+        item_id: itemId,
+        output_index: outputIndex,
+        delta: args,
+      });
+      yield emit("response.function_call_arguments.done", {
+        item_id: itemId,
+        output_index: outputIndex,
+        arguments: args,
+      });
+      yield emit("response.output_item.done", {
+        output_index: outputIndex,
+        item: {
+          id: itemId,
+          type: "function_call",
+          status: "completed",
+          call_id: callId,
+          name,
+          arguments: args,
+        },
       });
     } else if (event.type === "finish") {
       usage = usageFromEvent(event);

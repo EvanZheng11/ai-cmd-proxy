@@ -1,3 +1,6 @@
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+
 import type { ChatCompletionRequest, OpenAiChatMessage, OpenAiContentPart } from "../openai/types.js";
 import type { CommandCodeContentBlock, CommandCodeMessage } from "../commandcode/types.js";
 
@@ -6,22 +9,86 @@ function dataUrlParts(url: string): { mediaType: string; data: string } | undefi
   return match ? { mediaType: match[1], data: match[2] } : undefined;
 }
 
+type ResolvedAddress = {
+  address: string;
+  family: number;
+};
+
+type ImageMaterializeOptions = {
+  maxBytes?: number;
+  resolveHost?: (hostname: string) => Promise<ResolvedAddress[]>;
+};
+
 function isPrivateHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host === "::1" || host.endsWith(".localhost")) {
+  if (host === "localhost" || host === "::1" || host === "::" || host.endsWith(".localhost")) {
     return true;
   }
   if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) {
     return true;
   }
   const ipv4 = host.match(/^172\.(\d+)\./);
-  return Boolean(ipv4 && Number(ipv4[1]) >= 16 && Number(ipv4[1]) <= 31);
+  if (ipv4 && Number(ipv4[1]) >= 16 && Number(ipv4[1]) <= 31) {
+    return true;
+  }
+
+  if (isIP(host) === 6) {
+    if (/^(fc|fd)/i.test(host) || /^fe[89ab]/i.test(host) || /^ff/i.test(host)) {
+      return true;
+    }
+    const mappedIpv4 = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    return mappedIpv4 ? isPrivateHost(mappedIpv4[1]) : false;
+  }
+
+  return false;
+}
+
+async function readLimitedBody(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const declaredSize = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declaredSize) && declaredSize > maxBytes) {
+    throw new Error("Image response is too large");
+  }
+  if (!response.body) {
+    return new Uint8Array();
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel();
+        throw new Error("Image response is too large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 export async function materializeRemoteImages(
   request: ChatCompletionRequest,
   fetchImpl: typeof fetch = fetch,
+  options: ImageMaterializeOptions = {},
 ): Promise<ChatCompletionRequest> {
+  const maxBytes = options.maxBytes ?? 10_485_760;
+  const resolveHost = options.resolveHost
+    ?? (async (hostname: string) => lookup(hostname, { all: true, verbatim: true }));
   const messages = await Promise.all(request.messages.map(async (message) => {
     if (!Array.isArray(message.content)) {
       return message;
@@ -36,9 +103,14 @@ export async function materializeRemoteImages(
       if (!["http:", "https:"].includes(url.protocol) || isPrivateHost(url.hostname)) {
         throw new Error("Only public HTTP(S) image URLs are supported");
       }
+      const addresses = await resolveHost(url.hostname);
+      if (addresses.length === 0 || addresses.some((address) => isPrivateHost(address.address))) {
+        throw new Error("Only public HTTP(S) image URLs are supported");
+      }
 
       const response = await fetchImpl(url.toString(), {
         signal: AbortSignal.timeout(30_000),
+        redirect: "error",
       });
       if (!response.ok) {
         throw new Error(`Image URL returned HTTP ${response.status}`);
@@ -49,7 +121,7 @@ export async function materializeRemoteImages(
         throw new Error("Image URL did not return an image content type");
       }
 
-      const data = Buffer.from(await response.arrayBuffer()).toString("base64");
+      const data = Buffer.from(await readLimitedBody(response, maxBytes)).toString("base64");
       return {
         type: "image_url" as const,
         image_url: {

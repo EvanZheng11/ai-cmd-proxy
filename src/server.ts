@@ -20,6 +20,29 @@ export function buildServer(dependencies: ServerDependencies): FastifyInstance {
     bodyLimit: config.maxRequestBytes,
   });
 
+  app.setErrorHandler((error, _request, reply) => {
+    if (reply.sent) {
+      return;
+    }
+
+    const code = (error as { code?: string }).code;
+    const errorStatus = (error as { statusCode?: number }).statusCode;
+    const status = code === "FST_ERR_CTP_BODY_TOO_LARGE"
+      ? 413
+      : errorStatus && errorStatus >= 400
+        ? errorStatus
+        : 400;
+    const message = code === "FST_ERR_CTP_INVALID_JSON"
+      ? "Invalid JSON body"
+      : status === 413
+        ? "Request body is too large"
+        : "Request failed";
+    return reply.code(status).send(openAiError(status, message, {
+      type: "invalid_request_error",
+      code: code === "FST_ERR_CTP_BODY_TOO_LARGE" ? "request_too_large" : "invalid_request",
+    }));
+  });
+
   void registerChatCompletions(app, { ...dependencies, config });
   void registerResponses(app, { ...dependencies, config });
   void registerModels(app);

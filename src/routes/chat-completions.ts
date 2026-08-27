@@ -7,7 +7,7 @@ import {
   type CommandCodeClient,
 } from "../commandcode/client.js";
 import type { ProxyConfig } from "../config.js";
-import { openAiError, upstreamOpenAiError } from "../errors.js";
+import { openAiError, upstreamOpenAiError, UpstreamStreamError } from "../errors.js";
 import { parseChatCompletionRequest } from "../openai/schemas.js";
 import { toCommandCodeGenerateRequest } from "../translate/generate-request.js";
 import { materializeRemoteImages } from "../translate/messages.js";
@@ -68,14 +68,14 @@ export async function registerChatCompletions(
             reply.raw.write(chunk);
           }
         } catch (error) {
-          if (error instanceof CommandCodeUpstreamError) {
+          if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
             const mapped = upstreamOpenAiError(error.status);
             reply.raw.write(`data: ${JSON.stringify(mapped.body)}\n\n`);
+            reply.raw.write("data: [DONE]\n\n");
           } else {
             throw error;
           }
         } finally {
-          reply.raw.write("data: [DONE]\n\n");
           reply.raw.end();
         }
         return;
@@ -87,7 +87,7 @@ export async function registerChatCompletions(
       }
       return reply.send(toChatCompletion(collected, body));
     } catch (error) {
-      if (error instanceof CommandCodeUpstreamError) {
+      if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
         const mapped = upstreamOpenAiError(error.status);
         return reply.code(mapped.status).send(mapped.body);
       }

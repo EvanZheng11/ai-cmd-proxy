@@ -39,6 +39,17 @@ const toolSchema = z.object({
   }),
 });
 
+const responsesToolSchema = z.union([
+  toolSchema,
+  z.object({
+    type: z.literal("function"),
+    name: z.string().min(1),
+    description: z.string().optional(),
+    parameters: z.record(z.string(), z.unknown()).optional(),
+    strict: z.boolean().optional(),
+  }),
+]);
+
 export const chatCompletionRequestSchema = z.object({
   model: z.string().min(1),
   messages: z.array(messageSchema).min(1),
@@ -81,7 +92,7 @@ export const responsesRequestSchema = z.object({
   reasoning: z.object({
     effort: z.string().optional(),
   }).optional(),
-  tools: z.array(toolSchema).optional(),
+  tools: z.array(responsesToolSchema).optional(),
   text: z.object({
     format: z.record(z.string(), z.unknown()).optional(),
   }).optional(),
