@@ -1,3 +1,5 @@
+import { PassThrough } from "node:stream";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -30,7 +32,7 @@ describe("POST /v1/chat/completions", () => {
 
     const response = await app.inject({
       method: "POST",
-      url: "/v1/chat/completions",
+      url: "/v1/chat/completions?token=do-not-log",
       headers: { authorization: "Bearer request-key" },
       payload: {
         model: "deepseek/deepseek-v4-flash",
@@ -135,6 +137,57 @@ describe("POST /v1/chat/completions", () => {
     expect(response.json()).toMatchObject({
       error: { type: "api_error", code: "upstream_error" },
     });
+  });
+
+  it("logs request path, status, and elapsed time without the raw authorization", async () => {
+    const authorization = "Bearer test-secret-token";
+    const output = new PassThrough();
+    const lines: string[] = [];
+    output.on("data", (chunk: Buffer) => lines.push(chunk.toString()));
+
+    const app = buildServer({
+      commandCodeClient: {
+        async *stream() {
+          throw new CommandCodeUpstreamError("CommandCode returned HTTP 502", 502);
+        },
+      },
+      logger: { level: "info", stream: output },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: { authorization },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        messages: [{ role: "user", content: "Hi" }],
+      },
+    });
+    await app.close();
+
+    const logs = lines
+      .join("")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as {
+        req?: { url?: string };
+        res?: { statusCode?: number };
+        responseTime?: number;
+      });
+    const incomingLog = logs.find((record) => record.req?.url === "/v1/chat/completions");
+    const completedLog = logs.find((record) => record.res?.statusCode === 502);
+
+    expect(response.statusCode).toBe(502);
+    expect(incomingLog).toEqual(expect.objectContaining({
+      req: expect.objectContaining({ url: "/v1/chat/completions" }),
+    }));
+    expect(completedLog).toEqual(expect.objectContaining({
+      res: expect.objectContaining({ statusCode: 502 }),
+      responseTime: expect.any(Number),
+    }));
+    expect(lines.join("")).not.toContain(authorization);
+    expect(lines.join("")).not.toContain("do-not-log");
   });
 
   it("returns an OpenAI error for malformed JSON", async () => {

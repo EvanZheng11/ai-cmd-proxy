@@ -1,4 +1,7 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyServerOptions,
+} from "fastify";
 
 import type { CommandCodeClient } from "./commandcode/client.js";
 import { loadConfig, type ProxyConfig } from "./config.js";
@@ -11,12 +14,42 @@ import { openAiError } from "./errors.js";
 export type ServerDependencies = {
   commandCodeClient: CommandCodeClient;
   config?: ProxyConfig;
+  logger?: FastifyServerOptions["logger"];
 };
+
+function withSafeRequestSerializer(
+  logger: FastifyServerOptions["logger"],
+): FastifyServerOptions["logger"] {
+  if (!logger || typeof logger !== "object") {
+    return logger;
+  }
+
+  return {
+    ...logger,
+    serializers: {
+      ...logger.serializers,
+      req: (request) => ({
+        ...(logger.serializers?.req?.(request) ?? {}),
+        method: request.method,
+        url: request.url.split("?", 1)[0],
+      }),
+    },
+  };
+}
 
 export function buildServer(dependencies: ServerDependencies): FastifyInstance {
   const config = dependencies.config ?? loadConfig(process.env);
   const app = Fastify({
-    logger: false,
+    logger: withSafeRequestSerializer(dependencies.logger ?? {
+        level: "info",
+        redact: {
+          paths: [
+            "req.headers.authorization",
+            "req.headers.x-commandcode-api-key",
+          ],
+          censor: "[REDACTED]",
+        },
+      }),
     bodyLimit: config.maxRequestBytes,
   });
 
