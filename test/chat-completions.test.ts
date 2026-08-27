@@ -32,7 +32,7 @@ describe("POST /v1/chat/completions", () => {
 
     const response = await app.inject({
       method: "POST",
-      url: "/v1/chat/completions",
+      url: "/v1/chat/completions?token=do-not-log",
       headers: { authorization: "Bearer request-key" },
       payload: {
         model: "deepseek/deepseek-v4-flash",
@@ -145,8 +145,6 @@ describe("POST /v1/chat/completions", () => {
     const lines: string[] = [];
     output.on("data", (chunk: Buffer) => lines.push(chunk.toString()));
 
-    // 该参数表达 buildServer 应暴露的最小 logger 配置公共行为。
-    // @ts-expect-error buildServer 当前尚未接受 logger 配置。
     const app = buildServer({
       commandCodeClient: {
         async *stream() {
@@ -167,7 +165,7 @@ describe("POST /v1/chat/completions", () => {
     });
     await app.close();
 
-    const requestLog = lines
+    const logs = lines
       .join("")
       .trim()
       .split("\n")
@@ -176,17 +174,20 @@ describe("POST /v1/chat/completions", () => {
         req?: { url?: string };
         res?: { statusCode?: number };
         responseTime?: number;
-      })
-      .find((record) => record.req?.url === "/v1/chat/completions");
+      });
+    const incomingLog = logs.find((record) => record.req?.url === "/v1/chat/completions");
+    const completedLog = logs.find((record) => record.res?.statusCode === 502);
 
     expect(response.statusCode).toBe(502);
-    expect(lines.join("")).not.toContain("do-not-log");
-    expect(lines.join("")).not.toContain(authorization);
-    expect(requestLog).toEqual(expect.objectContaining({
+    expect(incomingLog).toEqual(expect.objectContaining({
       req: expect.objectContaining({ url: "/v1/chat/completions" }),
+    }));
+    expect(completedLog).toEqual(expect.objectContaining({
       res: expect.objectContaining({ statusCode: 502 }),
       responseTime: expect.any(Number),
     }));
+    expect(lines.join("")).not.toContain(authorization);
+    expect(lines.join("")).not.toContain("do-not-log");
   });
 
   it("returns an OpenAI error for malformed JSON", async () => {
