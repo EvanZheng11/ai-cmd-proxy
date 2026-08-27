@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import type { CommandCodeClient } from "../src/commandcode/client.js";
+import {
+  CommandCodeUpstreamError,
+  type CommandCodeClient,
+} from "../src/commandcode/client.js";
 import type { CommandCodeEvent } from "../src/commandcode/types.js";
 import { buildServer } from "../src/server.js";
 
@@ -86,6 +89,29 @@ describe("POST /v1/chat/completions", () => {
     expect(response.statusCode).toBe(401);
     expect(response.json()).toMatchObject({
       error: { type: "authentication_error" },
+    });
+  });
+
+  it("maps an upstream authentication failure to an OpenAI authentication error", async () => {
+    const response = await buildServer({
+      commandCodeClient: {
+        async *stream() {
+          throw new CommandCodeUpstreamError("CommandCode returned HTTP 401", 401);
+        },
+      },
+    }).inject({
+      method: "POST",
+      url: "/v1/chat/completions",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        messages: [{ role: "user", content: "Hi" }],
+      },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({
+      error: { type: "authentication_error", code: "upstream_authentication" },
     });
   });
 });

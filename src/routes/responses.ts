@@ -2,12 +2,19 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ZodError } from "zod";
 
 import { extractCredential } from "../auth.js";
-import type { CommandCodeClient } from "../commandcode/client.js";
-import { openAiError } from "../errors.js";
-import { toCommandCodeResponsesRequest, toChatRequestFromResponses, toResponse, toResponseEvents } from "../translate/responses.js";
+import {
+  CommandCodeUpstreamError,
+  type CommandCodeClient,
+} from "../commandcode/client.js";
+import type { ProxyConfig } from "../config.js";
+import { openAiError, upstreamOpenAiError } from "../errors.js";
+import { toCommandCodeGenerateRequest } from "../translate/generate-request.js";
+import { toChatRequestFromResponses, toResponse, toResponseEvents } from "../translate/responses.js";
+import { materializeRemoteImages } from "../translate/messages.js";
 
 type ResponsesRouteDependencies = {
   commandCodeClient: CommandCodeClient;
+  config: ProxyConfig;
 };
 
 function sendError(reply: FastifyReply, status: number, message: string, code: string) {
@@ -28,11 +35,13 @@ export async function registerResponses(
     }
 
     try {
-      const body = toChatRequestFromResponses(request.body);
+      const body = await materializeRemoteImages(toChatRequestFromResponses(request.body));
       const original = request.body as { stream?: boolean };
       const events = dependencies.commandCodeClient.stream({
         apiKey,
-        request: toCommandCodeResponsesRequest(request.body),
+        request: toCommandCodeGenerateRequest(body, {
+          defaultMaxTokens: dependencies.config.defaultMaxTokens,
+        }),
       });
 
       if (original.stream) {
@@ -58,6 +67,10 @@ export async function registerResponses(
       }
       return reply.send(toResponse(collected, body.model));
     } catch (error) {
+      if (error instanceof CommandCodeUpstreamError) {
+        const mapped = upstreamOpenAiError(error.status);
+        return reply.code(mapped.status).send(mapped.body);
+      }
       if (error instanceof ZodError || error instanceof Error) {
         return sendError(reply, 400, error instanceof ZodError
           ? error.issues[0]?.message ?? "Invalid request"

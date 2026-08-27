@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { toCommandCodeGenerateRequest } from "../src/translate/generate-request.js";
+import { materializeRemoteImages } from "../src/translate/messages.js";
 
 describe("OpenAI request translation", () => {
   it("maps text, system instructions, and max completion tokens", () => {
@@ -80,5 +81,79 @@ describe("OpenAI request translation", () => {
       stop: ["END"],
       reasoning_effort: "high",
     });
+  });
+
+  it("uses the configured default token cap when callers omit a limit", () => {
+    const result = toCommandCodeGenerateRequest({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{ role: "user", content: "Default limit" }],
+    }, { defaultMaxTokens: 777 });
+
+    expect(result.params.max_tokens).toBe(777);
+  });
+
+  it("preserves assistant tool calls and tool results", () => {
+    const result = toCommandCodeGenerateRequest({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call_1",
+            type: "function",
+            function: { name: "lookup", arguments: "{\"id\":\"7\"}" },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_1",
+          content: "record found",
+        },
+      ],
+    });
+
+    expect(result.params.messages).toEqual([
+      {
+        role: "assistant",
+        content: [{
+          type: "tool-call",
+          toolCallId: "call_1",
+          toolName: "lookup",
+          input: { id: "7" },
+        }],
+      },
+      {
+        role: "tool",
+        content: [{
+          type: "tool-result",
+          toolCallId: "call_1",
+          toolName: "lookup",
+          output: "record found",
+        }],
+      },
+    ]);
+  });
+
+  it("materializes a public image URL as a base64 data URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "image/png" },
+      }),
+    );
+
+    const result = await materializeRemoteImages({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{
+        role: "user",
+        content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }],
+      }],
+    }, fetchMock);
+
+    expect(result.messages[0]?.content).toEqual([{
+      type: "image_url",
+      image_url: { url: "data:image/png;base64,AQID" },
+    }]);
   });
 });

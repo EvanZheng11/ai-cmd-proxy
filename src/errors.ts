@@ -33,3 +33,22 @@ export function openAiError(
     },
   };
 }
+
+export function upstreamOpenAiError(status: number, message = "CommandCode upstream request failed") {
+  const type: OpenAiErrorType = status === 401
+    ? "authentication_error"
+    : status === 429
+      ? "rate_limit_error"
+      : "api_error";
+  return {
+    status: status === 401 || status === 429 || status >= 500 ? status : 502,
+    body: openAiError(status, message, {
+      type,
+      code: status === 401
+        ? "upstream_authentication"
+        : status === 429
+          ? "upstream_rate_limit"
+          : "upstream_error",
+    }),
+  };
+}

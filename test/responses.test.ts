@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { CommandCodeClient } from "../src/commandcode/client.js";
 import type { CommandCodeEvent } from "../src/commandcode/types.js";
 import { buildServer } from "../src/server.js";
+import { toChatRequestFromResponses } from "../src/translate/responses.js";
 
 function fakeClient(events: CommandCodeEvent[]): CommandCodeClient {
   return {
@@ -13,6 +14,27 @@ function fakeClient(events: CommandCodeEvent[]): CommandCodeClient {
 }
 
 describe("POST /v1/responses", () => {
+  it("normalizes Responses input_text and input_image parts", () => {
+    const result = toChatRequestFromResponses({
+      model: "deepseek/deepseek-v4-flash",
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_text", text: "Describe this" },
+          { type: "input_image", image_url: "https://example.com/a.png" },
+        ],
+      }],
+    });
+
+    expect(result.messages[0]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Describe this" },
+        { type: "image_url", image_url: { url: "https://example.com/a.png" } },
+      ],
+    });
+  });
+
   it("returns a Responses API output item", async () => {
     const response = await buildServer({
       commandCodeClient: fakeClient([

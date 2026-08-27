@@ -16,15 +16,39 @@ type ResponseState = {
 };
 
 function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest["messages"] {
+  const normalizeParts = (parts: unknown[]) => parts.map((part) => {
+    if (!part || typeof part !== "object") {
+      return part;
+    }
+    const value = part as Record<string, unknown>;
+    if (value.type === "input_text" && typeof value.text === "string") {
+      return { type: "text" as const, text: value.text };
+    }
+    if (value.type === "input_image") {
+      const imageUrl = typeof value.image_url === "string"
+        ? value.image_url
+        : value.image_url && typeof value.image_url === "object"
+          ? String((value.image_url as Record<string, unknown>).url ?? "")
+          : "";
+      return { type: "image_url" as const, image_url: { url: imageUrl } };
+    }
+    return part;
+  });
+
   if (typeof input === "string") {
     return [{ role: "user" as const, content: input }];
   }
 
   if (Array.isArray(input) && input.every((item) => typeof item === "object" && item !== null && "role" in item)) {
-    return input as ChatCompletionRequest["messages"];
+    return (input as Array<Record<string, unknown>>).map((message) => ({
+      ...message,
+      ...(Array.isArray(message.content)
+        ? { content: normalizeParts(message.content) }
+        : {}),
+    })) as ChatCompletionRequest["messages"];
   }
 
-  return [{ role: "user" as const, content: input as never }];
+  return [{ role: "user" as const, content: normalizeParts(input as unknown[]) as never }];
 }
 
 export function toChatRequestFromResponses(input: unknown): ChatCompletionRequest {
@@ -50,8 +74,11 @@ export function toChatRequestFromResponses(input: unknown): ChatCompletionReques
   };
 }
 
-export function toCommandCodeResponsesRequest(input: unknown) {
-  return toCommandCodeGenerateRequest(toChatRequestFromResponses(input));
+export function toCommandCodeResponsesRequest(
+  input: unknown,
+  options: { defaultMaxTokens?: number } = {},
+) {
+  return toCommandCodeGenerateRequest(toChatRequestFromResponses(input), options);
 }
 
 function usageFromEvent(event: CommandCodeEvent) {

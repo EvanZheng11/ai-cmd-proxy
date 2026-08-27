@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 
 import type { CommandCodeClient } from "./commandcode/client.js";
+import { loadConfig, type ProxyConfig } from "./config.js";
 import { registerChatCompletions } from "./routes/chat-completions.js";
 import { registerHealth } from "./routes/health.js";
 import { registerModels } from "./routes/models.js";
@@ -9,16 +10,18 @@ import { openAiError } from "./errors.js";
 
 export type ServerDependencies = {
   commandCodeClient: CommandCodeClient;
+  config?: ProxyConfig;
 };
 
 export function buildServer(dependencies: ServerDependencies): FastifyInstance {
+  const config = dependencies.config ?? loadConfig(process.env);
   const app = Fastify({
     logger: false,
-    bodyLimit: 20_971_520,
+    bodyLimit: config.maxRequestBytes,
   });
 
-  void registerChatCompletions(app, dependencies);
-  void registerResponses(app, dependencies);
+  void registerChatCompletions(app, { ...dependencies, config });
+  void registerResponses(app, { ...dependencies, config });
   void registerModels(app);
   void registerHealth(app);
 

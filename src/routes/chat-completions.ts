@@ -2,14 +2,20 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ZodError } from "zod";
 
 import { extractCredential } from "../auth.js";
-import type { CommandCodeClient } from "../commandcode/client.js";
-import { openAiError } from "../errors.js";
+import {
+  CommandCodeUpstreamError,
+  type CommandCodeClient,
+} from "../commandcode/client.js";
+import type { ProxyConfig } from "../config.js";
+import { openAiError, upstreamOpenAiError } from "../errors.js";
 import { parseChatCompletionRequest } from "../openai/schemas.js";
 import { toCommandCodeGenerateRequest } from "../translate/generate-request.js";
+import { materializeRemoteImages } from "../translate/messages.js";
 import { toChatCompletion, toChatCompletionChunks } from "../translate/chat.js";
 
 type ChatRouteDependencies = {
   commandCodeClient: CommandCodeClient;
+  config: ProxyConfig;
 };
 
 function sendError(reply: FastifyReply, status: number, message: string, code: string) {
@@ -39,34 +45,56 @@ export async function registerChatCompletions(
       throw error;
     }
 
-    const commandRequest = toCommandCodeGenerateRequest(body);
-    const events = dependencies.commandCodeClient.stream({
-      apiKey,
-      request: commandRequest,
-    });
-
-    if (body.stream) {
-      reply.hijack();
-      reply.raw.writeHead(200, {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
+    try {
+      const hydratedBody = await materializeRemoteImages(body);
+      const commandRequest = toCommandCodeGenerateRequest(hydratedBody, {
+        defaultMaxTokens: dependencies.config.defaultMaxTokens,
+      });
+      const events = dependencies.commandCodeClient.stream({
+        apiKey,
+        request: commandRequest,
       });
 
-      try {
-        for await (const chunk of toChatCompletionChunks(events, body)) {
-          reply.raw.write(chunk);
-        }
-      } finally {
-        reply.raw.end();
-      }
-      return;
-    }
+      if (body.stream) {
+        reply.hijack();
+        reply.raw.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
 
-    const collected = [];
-    for await (const event of events) {
-      collected.push(event);
+        try {
+          for await (const chunk of toChatCompletionChunks(events, body)) {
+            reply.raw.write(chunk);
+          }
+        } catch (error) {
+          if (error instanceof CommandCodeUpstreamError) {
+            const mapped = upstreamOpenAiError(error.status);
+            reply.raw.write(`data: ${JSON.stringify(mapped.body)}\n\n`);
+          } else {
+            throw error;
+          }
+        } finally {
+          reply.raw.write("data: [DONE]\n\n");
+          reply.raw.end();
+        }
+        return;
+      }
+
+      const collected = [];
+      for await (const event of events) {
+        collected.push(event);
+      }
+      return reply.send(toChatCompletion(collected, body));
+    } catch (error) {
+      if (error instanceof CommandCodeUpstreamError) {
+        const mapped = upstreamOpenAiError(error.status);
+        return reply.code(mapped.status).send(mapped.body);
+      }
+      if (error instanceof Error) {
+        return sendError(reply, 400, error.message, "invalid_request");
+      }
+      throw error;
     }
-    return reply.send(toChatCompletion(collected, body));
   });
 }

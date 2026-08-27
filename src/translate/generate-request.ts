@@ -20,11 +20,17 @@ function structuredOutputInstruction(request: ChatCompletionRequest): string {
   ].join("\n");
 }
 
-export function toCommandCodeGenerateRequest(input: unknown): CommandCodeGenerateInput {
+export function toCommandCodeGenerateRequest(
+  input: unknown,
+  options: { defaultMaxTokens?: number } = {},
+): CommandCodeGenerateInput {
   const request = parseChatCompletionRequest(input);
   const { messages, system } = toCommandCodeMessages(request.messages);
   const structuredInstruction = structuredOutputInstruction(request);
-  const maxTokens = request.max_completion_tokens ?? request.max_tokens ?? 1_000_000;
+  const maxTokens = request.max_completion_tokens
+    ?? request.max_tokens
+    ?? options.defaultMaxTokens
+    ?? 1_000_000;
 
   return {
     memory: null,
