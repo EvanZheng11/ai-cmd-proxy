@@ -1,28 +1,6 @@
-# Go binaries
-bin/
-*.exe
-
-data/
-
-# Runtime data
-logs/
-proxy.pid
-proxy-config.json
-
-# Editor/OS
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
-
-# IDE
-.idea/
-.vscode/
-*.iml
-
-# Temp
-_temp/
-
-# Hana skill installation
-.hanako/
+node_modules/
+dist/
+.env
+coverage/
+.ai-cmd-proxy.pid
+.ai-cmd-proxy.log
