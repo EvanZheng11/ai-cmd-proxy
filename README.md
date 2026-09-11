@@ -55,6 +55,35 @@ Set `"stream": true` for Server-Sent Events. The proxy also accepts `X-CommandCo
 
 Use `POST /v1/responses` with `model`, `input`, optional `instructions`, `tools`, `reasoning`, and `stream`.
 
+## OpenCode Image Input
+
+For OpenCode, declare the visual model as accepting image input. Otherwise OpenCode replaces the attachment with an error text before the request reaches this proxy:
+
+```jsonc
+{
+  "provider": {
+    "commandcode": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:3000/v1"
+      },
+      "models": {
+        "deepseek/deepseek-v4-flash-vision-exp": {
+          "name": "CommandCode DeepSeek Vision",
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Keep the model name as `deepseek/deepseek-v4-flash-vision-exp`. When an image is present, the proxy converts data URLs or public image URLs to CommandCode image blocks in the native `image`/`mediaType` format.
+
 ## Endpoints
 
 - `GET /healthz`
@@ -77,3 +106,19 @@ DEFAULT_MAX_TOKENS=1000000
 REQUEST_TIMEOUT_MS=600000
 MAX_REQUEST_BYTES=20971520
 ```
+
+## Prompt Pass-Through Behavior
+
+The proxy does not append JSON or other natural-language instructions to prompts.
+The adapter has no verified native structured-output support, so JSON
+`response_format` and non-text Responses `text.format` requests return HTTP 400
+instead of modifying the prompt. Explicit `type: "text"` remains supported.
+
+System and developer text is collected in order into the upstream's single
+system string with `\n\n` between messages (including empty messages) and `\n`
+between text blocks. Original role boundaries and positions relative to other
+messages cannot be represented by this protocol. Text whitespace is not trimmed.
+Tool and image conversion remains unchanged, including downloading remote images
+as base64. Session IDs, environment config, and cache usage reporting are unchanged.
+This is not a byte-for-byte relay and does not guarantee improved cache hit rates;
+cache hits are determined by the upstream provider.

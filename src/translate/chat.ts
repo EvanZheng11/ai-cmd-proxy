@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
 
 import type { ChatCompletionRequest } from "../openai/types.js";
-import type { CommandCodeEvent } from "../commandcode/types.js";
-import { UpstreamStreamError } from "../errors.js";
+import type { CommandCodeEvent, CommandCodeUsage } from "../commandcode/types.js";
+import { eventStatusCode, UpstreamStreamError } from "../errors.js";
 
 type Usage = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  // sub2api 等下游从 prompt_tokens_details.cached_tokens 读取缓存命中量；
+  // 缺少该字段时缓存率会被统计成 0（上游实际命中率可达 90%+）。
+  prompt_tokens_details: {
+    cached_tokens: number;
+  };
 };
 
 type ChatState = {
@@ -21,19 +26,35 @@ type ChatState = {
   usage?: Usage;
 };
 
+// 上游可能把缓存命中量放在 cachedInputTokens 或 inputTokenDetails.cacheReadTokens，
+// 且某些供应商两者都没给——缺失时按 0 处理。
+function cacheReadTokens(usage: CommandCodeUsage | undefined): number {
+  if (!usage) {
+    return 0;
+  }
+  return usage.cachedInputTokens
+    ?? usage.inputTokenDetails?.cacheReadTokens
+    ?? 0;
+}
+
 function usageFromEvent(event: CommandCodeEvent): Usage | undefined {
-  const input = event.totalUsage?.inputTokens;
-  const output = event.totalUsage?.outputTokens;
+  const usage = event.totalUsage;
+  const input = usage?.inputTokens;
+  const output = usage?.outputTokens;
   if (input === undefined && output === undefined) {
     return undefined;
   }
 
+  // inputTokens 已包含命中缓存的 token，因此这里不再叠加 cached。
   const promptTokens = input ?? 0;
   const completionTokens = output ?? 0;
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     total_tokens: promptTokens + completionTokens,
+    prompt_tokens_details: {
+      cached_tokens: cacheReadTokens(usage),
+    },
   };
 }
 
@@ -53,10 +74,11 @@ export function aggregateChatEvents(events: CommandCodeEvent[]): ChatState {
 
   for (const event of events) {
     if (event.type === "error" || event.type === "abort") {
+      // 上游把限流/套餐等真实原因放在 error.message 里，透传 avoid 丢失上下文。
       const message = typeof event.error === "string"
         ? event.error
         : event.error?.message ?? "CommandCode stream aborted";
-      throw new UpstreamStreamError(message, event.statusCode ?? 502);
+      throw new UpstreamStreamError(message, eventStatusCode(event));
     } else if (event.type === "text-delta") {
       state.text += event.text ?? "";
     } else if (event.type === "tool-call") {
@@ -140,10 +162,11 @@ export async function* toChatCompletionChunks(
 
   for await (const event of events) {
     if (event.type === "error" || event.type === "abort") {
+      // 上游把限流/套餐等真实原因放在 error.message 里，透传 avoid 丢失上下文。
       const message = typeof event.error === "string"
         ? event.error
         : event.error?.message ?? "CommandCode stream aborted";
-      throw new UpstreamStreamError(message, event.statusCode ?? 502);
+      throw new UpstreamStreamError(message, eventStatusCode(event));
     } else if (event.type === "text-delta" && event.text) {
       sawContent = true;
       yield emit({

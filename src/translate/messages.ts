@@ -158,8 +158,8 @@ function toContent(content: string | OpenAiContentPart[] | null | undefined): Co
 
     return {
       type: "image",
-      media_type: image.mediaType,
-      data: image.data,
+      image: `data:${image.mediaType};base64,${image.data}`,
+      mediaType: image.mediaType,
     };
   });
 }
@@ -207,7 +207,10 @@ export function toCommandCodeMessages(messages: OpenAiChatMessage[]): {
         type: "tool-result",
         toolCallId: message.tool_call_id ?? "",
         toolName: toolNames.get(message.tool_call_id ?? "") ?? "unknown",
-        output: typeof message.content === "string" ? message.content : content,
+        output: {
+          type: "text",
+          value: typeof message.content === "string" ? message.content : JSON.stringify(content),
+        },
       });
     }
 
@@ -217,5 +220,5 @@ export function toCommandCodeMessages(messages: OpenAiChatMessage[]): {
     });
   }
 
-  return { messages: result, system: systemParts.filter(Boolean).join("\n\n") };
+  return { messages: result, system: systemParts.join("\n\n") };
 }

@@ -4,8 +4,9 @@ import { loadConfig } from "../src/config.js";
 import { openAiError } from "../src/errors.js";
 
 describe("proxy configuration", () => {
-  it("uses a one million token default", () => {
-    expect(loadConfig({}).defaultMaxTokens).toBe(1_000_000);
+  it("uses an upstream-safe default token cap", () => {
+    // 上游 params.max_tokens 上限为 200000，默认值必须落在上限内。
+    expect(loadConfig({}).defaultMaxTokens).toBe(32_000);
   });
 });
 

@@ -22,6 +22,28 @@ describe("OpenAI request translation", () => {
     ]);
   });
 
+  it("does not inject proxy instructions into the system prompt", () => {
+    expect(() => toCommandCodeGenerateRequest({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{ role: "user", content: "Return JSON" }],
+      response_format: { type: "json_object" },
+    })).toThrow("Structured output");
+  });
+
+  it("preserves empty system and developer message boundaries", () => {
+    const result = toCommandCodeGenerateRequest({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [
+        { role: "system", content: "first" },
+        { role: "developer", content: "" },
+        { role: "system", content: "second" },
+        { role: "user", content: "hello" },
+      ],
+    });
+
+    expect(result.params.system).toBe("first\n\n\n\nsecond");
+  });
+
   it("maps image data URLs and function tools", () => {
     const result = toCommandCodeGenerateRequest({
       model: "deepseek/deepseek-v4-flash",
@@ -50,9 +72,10 @@ describe("OpenAI request translation", () => {
 
     expect(result.params.messages[0]?.content[1]).toMatchObject({
       type: "image",
-      media_type: "image/png",
-      data: "aGVsbG8=",
+      image: "data:image/png;base64,aGVsbG8=",
+      mediaType: "image/png",
     });
+    expect(result.mode).toBe("agent");
     expect(result.params.tools[0]).toEqual({
       name: "lookup",
       description: "Find a record",
@@ -92,16 +115,39 @@ describe("OpenAI request translation", () => {
     expect(result.params.max_tokens).toBe(777);
   });
 
-  it("rejects tool selection controls that CommandCode cannot represent", () => {
-    expect(() => toCommandCodeGenerateRequest({
+  it("translates tool selection controls into upstream object form", () => {
+    const request = {
       model: "deepseek/deepseek-v4-flash",
       messages: [{ role: "user", content: "Use tools" }],
       tools: [{
         type: "function",
         function: { name: "lookup", parameters: { type: "object" } },
       }],
-      tool_choice: "required",
-    })).toThrow("tool_choice");
+    };
+
+    // 上游只接受对象形式；字符串形式会被上游 zod 校验拒绝。
+    expect(toCommandCodeGenerateRequest({ ...request, tool_choice: "required" })
+      .params.tool_choice).toEqual({ type: "required" });
+    expect(toCommandCodeGenerateRequest({ ...request, tool_choice: "auto" })
+      .params.tool_choice).toEqual({ type: "auto" });
+    expect(toCommandCodeGenerateRequest({ ...request, tool_choice: "none" })
+      .params.tool_choice).toEqual({ type: "none" });
+    expect(toCommandCodeGenerateRequest({
+      ...request,
+      tool_choice: { type: "function", function: { name: "lookup" } },
+    }).params.tool_choice).toEqual({ type: "tool", name: "lookup" });
+    // 未指定时不注入该字段。
+    expect(toCommandCodeGenerateRequest(request).params.tool_choice).toBeUndefined();
+  });
+
+  it("ignores parallel_tool_calls instead of failing the request", () => {
+    // OpenCode 等 agent 会带这个字段；上游没有对应能力，忽略即可。
+    const result = toCommandCodeGenerateRequest({
+      model: "deepseek/deepseek-v4-flash",
+      messages: [{ role: "user", content: "Use tools" }],
+      parallel_tool_calls: true,
+    });
+    expect(result.params.parallel_tool_calls).toBeUndefined();
   });
 
   it("preserves assistant tool calls and tool results", () => {
@@ -141,7 +187,7 @@ describe("OpenAI request translation", () => {
           type: "tool-result",
           toolCallId: "call_1",
           toolName: "lookup",
-          output: "record found",
+          output: { type: "text", value: "record found" },
         }],
       },
     ]);

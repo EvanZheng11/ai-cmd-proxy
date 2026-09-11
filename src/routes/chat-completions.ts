@@ -7,7 +7,12 @@ import {
   type CommandCodeClient,
 } from "../commandcode/client.js";
 import type { ProxyConfig } from "../config.js";
-import { openAiError, upstreamOpenAiError, UpstreamStreamError } from "../errors.js";
+import {
+  openAiError,
+  upstreamErrorMessage,
+  upstreamOpenAiError,
+  UpstreamStreamError,
+} from "../errors.js";
 import { parseChatCompletionRequest } from "../openai/schemas.js";
 import { toCommandCodeGenerateRequest } from "../translate/generate-request.js";
 import { materializeRemoteImages } from "../translate/messages.js";
@@ -24,6 +29,7 @@ function sendError(reply: FastifyReply, status: number, message: string, code: s
     code,
   }));
 }
+
 
 export async function registerChatCompletions(
   app: FastifyInstance,
@@ -91,7 +97,7 @@ export async function registerChatCompletions(
           }
         } catch (error) {
           if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
-            const mapped = upstreamOpenAiError(error.status);
+            const mapped = upstreamOpenAiError(error.status, upstreamErrorMessage(error instanceof CommandCodeUpstreamError ? error.body : undefined, error.message));
             reply.raw.write(`data: ${JSON.stringify(mapped.body)}\n\n`);
             reply.raw.write("data: [DONE]\n\n");
           } else {
@@ -110,7 +116,7 @@ export async function registerChatCompletions(
       return reply.send(toChatCompletion(collected, body));
     } catch (error) {
       if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
-        const mapped = upstreamOpenAiError(error.status);
+        const mapped = upstreamOpenAiError(error.status, upstreamErrorMessage(error instanceof CommandCodeUpstreamError ? error.body : undefined, error.message));
         return reply.code(mapped.status).send(mapped.body);
       }
       if (error instanceof Error) {

@@ -78,7 +78,7 @@ export function buildServer(dependencies: ServerDependencies): FastifyInstance {
 
   void registerChatCompletions(app, { ...dependencies, config });
   void registerResponses(app, { ...dependencies, config });
-  void registerModels(app);
+  void registerModels(app, config);
   void registerHealth(app);
 
   app.all("/v1/*", async (_request, reply) => {

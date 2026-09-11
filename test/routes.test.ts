@@ -14,9 +14,15 @@ describe("utility routes", () => {
     const app = buildServer({ commandCodeClient: emptyClient });
 
     expect((await app.inject("/healthz")).json()).toEqual({ status: "ok" });
-    expect((await app.inject("/v1/models")).json()).toMatchObject({
-      object: "list",
-    });
+    const models = (await app.inject("/v1/models")).json();
+    expect(models.object).toBe("list");
+    expect(models.data).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "deepseek/deepseek-v4-flash-vision-exp",
+        attachment: true,
+        modalities: { input: ["text", "image"], output: ["text"] },
+      }),
+    ]));
   });
 
   it("returns an OpenAI-shaped error for unsupported API groups", async () => {

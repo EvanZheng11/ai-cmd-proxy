@@ -95,10 +95,36 @@ describe("POST /v1/chat/completions", () => {
       },
     });
 
-    expect(response.statusCode).toBe(502);
+    // 上游 400 表示请求本身有问题，透传比折叠成 502 更利于池化网关判断
+    // "该换参数/模型" 而不是 "该换账号"。
+    expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({
-      error: { type: "api_error", code: "upstream_error" },
+      error: { type: "invalid_request_error", code: "upstream_invalid_request" },
     });
+  });
+
+  it("preserves upstream plan and rate-limit statuses", async () => {
+    // 403 = 套餐不含该模型，429 = 限流；sub2api 需要原样看到才能正确换账号。
+    for (const [status, code] of [[403, "upstream_authentication"], [429, "upstream_rate_limit"]] as const) {
+      const response = await buildServer({
+        commandCodeClient: {
+          async *stream() {
+            throw new CommandCodeUpstreamError(`CommandCode returned HTTP ${status}`, status);
+          },
+        },
+      }).inject({
+        method: "POST",
+        url: "/v1/chat/completions",
+        headers: { authorization: "Bearer request-key" },
+        payload: {
+          model: "deepseek/deepseek-v4-flash",
+          messages: [{ role: "user", content: "Hi" }],
+        },
+      });
+
+      expect(response.statusCode).toBe(status);
+      expect(response.json()).toMatchObject({ error: { code } });
+    }
   });
 
   it("rejects requests without a credential", async () => {

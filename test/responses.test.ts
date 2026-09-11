@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { PassThrough } from "node:stream";
 
 import {
   createCommandCodeClient,
@@ -7,6 +8,7 @@ import {
 import type { CommandCodeEvent } from "../src/commandcode/types.js";
 import { loadConfig } from "../src/config.js";
 import { buildServer } from "../src/server.js";
+import { toCommandCodeGenerateRequest } from "../src/translate/generate-request.js";
 import { toChatRequestFromResponses } from "../src/translate/responses.js";
 
 function fakeClient(events: CommandCodeEvent[]): CommandCodeClient {
@@ -18,6 +20,41 @@ function fakeClient(events: CommandCodeEvent[]): CommandCodeClient {
 }
 
 describe("POST /v1/responses", () => {
+  it("preserves explicit text format and empty instructions", () => {
+    const request = toChatRequestFromResponses({
+      model: "test-model",
+      instructions: "",
+      input: "  hello\n",
+      text: { format: { type: "text" } },
+    });
+    expect(request.messages).toEqual([
+      { role: "system", content: "" },
+      { role: "user", content: "  hello\n" },
+    ]);
+    expect(toCommandCodeGenerateRequest(request).params.system).toBe("");
+  });
+
+  it.each([
+    ["/v1/chat/completions", { messages: [{ role: "user", content: "Hello" }], response_format: { type: "json_object" } }],
+    ["/v1/chat/completions", { messages: [{ role: "user", content: "Hello" }], response_format: { type: "json_schema", json_schema: { name: "answer", schema: { type: "object" } } } }],
+    ["/v1/responses", { input: "Hello", text: { format: { type: "json_schema", name: "answer", schema: { type: "object" } } } }],
+  ])("rejects structured output before calling upstream at %s", async (url, payload) => {
+    const stream = vi.fn();
+    const app = buildServer({ commandCodeClient: { stream } });
+    try {
+      const response = await app.inject({
+        method: "POST", url,
+        headers: { authorization: "Bearer request-key" },
+        payload: { model: "test-model", ...payload },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.message).toContain("Structured output");
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
   it("normalizes Responses input_text and input_image parts", () => {
     const result = toChatRequestFromResponses({
       model: "deepseek/deepseek-v4-flash",
@@ -36,6 +73,73 @@ describe("POST /v1/responses", () => {
         { type: "text", text: "Describe this" },
         { type: "image_url", image_url: { url: "https://example.com/a.png" } },
       ],
+    });
+  });
+
+  it("converts an OpenAI Responses image_url data URL into a CommandCode image", () => {
+    const request = toCommandCodeGenerateRequest(toChatRequestFromResponses({
+      model: "deepseek/deepseek-v4-flash-vision-exp",
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_text", text: "Describe this image" },
+          {
+            type: "input_image",
+            image_url: "data:image/png;base64,aGVsbG8=",
+            detail: "high",
+          },
+        ],
+      }],
+    }));
+
+    expect(request.params.messages[0]?.content).toEqual([
+      { type: "text", text: "Describe this image" },
+      { type: "image", image: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" },
+    ]);
+  });
+
+  it("preserves OpenAI image_url parts in Responses role messages", () => {
+    const request = toCommandCodeGenerateRequest(toChatRequestFromResponses({
+      model: "deepseek/deepseek-v4-flash-vision-exp",
+      input: [{
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this image" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/jpeg;base64,aGVsbG8=" },
+          },
+        ],
+      }],
+    }));
+
+    expect(request.params.messages[0]?.content).toEqual([
+      { type: "text", text: "Describe this image" },
+      { type: "image", image: "data:image/jpeg;base64,aGVsbG8=", mediaType: "image/jpeg" },
+    ]);
+  });
+
+  it("rejects OpenAI Responses image file_id inputs", async () => {
+    const response = await buildServer({
+      commandCodeClient: fakeClient([]),
+    }).inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash-vision-exp",
+        input: [{
+          role: "user",
+          content: [{ type: "input_image", file_id: "file_image" }],
+        }],
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: "unsupported_image_file_id",
+      },
     });
   });
 
@@ -61,8 +165,77 @@ describe("POST /v1/responses", () => {
     }]);
   });
 
-  it("maps Responses text.format to a structured output request", () => {
+  it("normalizes Responses output history for a follow-up request", () => {
     const result = toChatRequestFromResponses({
+      model: "deepseek/deepseek-v4-flash",
+      input: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "I will check that." }],
+        },
+        {
+          type: "function_call",
+          call_id: "call_lookup",
+          name: "lookup",
+          arguments: "{\"id\":\"7\"}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_lookup",
+          output: "{\"name\":\"Ada\"}",
+        },
+        { type: "input_text", text: "Continue." },
+      ],
+    });
+
+    expect(result.messages).toEqual([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "I will check that." }],
+        tool_calls: [{
+          id: "call_lookup",
+          type: "function",
+          function: { name: "lookup", arguments: "{\"id\":\"7\"}" },
+        }],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_lookup",
+        content: "{\"name\":\"Ada\"}",
+      },
+      { role: "user", content: [{ type: "text", text: "Continue." }] },
+    ]);
+
+    const commandRequest = toCommandCodeGenerateRequest(result);
+    expect(commandRequest.params.messages).toEqual([
+      {
+        role: "assistant",
+        content: [{
+          type: "text",
+          text: "I will check that.",
+        }, {
+          type: "tool-call",
+          toolCallId: "call_lookup",
+          toolName: "lookup",
+          input: { id: "7" },
+        }],
+      },
+      {
+        role: "tool",
+        content: [{
+          type: "tool-result",
+          toolCallId: "call_lookup",
+          toolName: "lookup",
+          output: { type: "text", value: "{\"name\":\"Ada\"}" },
+        }],
+      },
+      { role: "user", content: [{ type: "text", text: "Continue." }] },
+    ]);
+  });
+
+  it("rejects Responses structured output without changing the prompt", () => {
+    expect(() => toChatRequestFromResponses({
       model: "deepseek/deepseek-v4-flash",
       input: "Return JSON",
       text: {
@@ -72,16 +245,7 @@ describe("POST /v1/responses", () => {
           schema: { type: "object", properties: { value: { type: "string" } } },
         },
       },
-    });
-
-    expect(result.response_format).toEqual({
-      type: "json_schema",
-      json_schema: {
-        type: "json_schema",
-        name: "answer",
-        schema: { type: "object", properties: { value: { type: "string" } } },
-      },
-    });
+    })).toThrow("Structured output");
   });
 
   it("returns a Responses API output item", async () => {
@@ -109,6 +273,33 @@ describe("POST /v1/responses", () => {
         content: [{ type: "output_text", text: "TEST_OK" }],
       }],
     });
+  });
+
+  it("logs the inbound request when local Responses conversion fails", async () => {
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on("data", (chunk: Buffer) => chunks.push(chunk.toString()));
+    const app = buildServer({
+      commandCodeClient: fakeClient([]),
+      logger: { level: "info", stream: output },
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        input: [{ type: "unsupported_input_item", value: "bad" }],
+      },
+    });
+    await app.close();
+
+    const logs = chunks.join("");
+    expect(response.statusCode).toBe(400);
+    expect(logs).toContain("CommandCode Responses 入站请求参数");
+    expect(logs).toContain("unsupported_input_item");
+    expect(logs).toContain("CommandCode Responses 本地处理失败");
   });
 
   it("returns function_call output for an upstream tool call", async () => {
@@ -167,9 +358,13 @@ describe("POST /v1/responses", () => {
     expect(response.body).toContain("response.completed");
   });
 
-  it("rejects previous_response_id while the proxy is stateless", async () => {
+  it("creates a reasoning item before emitting reasoning deltas", async () => {
     const response = await buildServer({
-      commandCodeClient: fakeClient([]),
+      commandCodeClient: fakeClient([
+        { type: "reasoning-delta", text: "Thinking" },
+        { type: "text-delta", text: "TEST_OK" },
+        { type: "finish", finishReason: "end_turn" },
+      ]),
     }).inject({
       method: "POST",
       url: "/v1/responses",
@@ -177,13 +372,38 @@ describe("POST /v1/responses", () => {
       payload: {
         model: "deepseek/deepseek-v4-flash",
         input: "Hi",
+        stream: true,
+      },
+    });
+
+    const added = response.body.indexOf("response.output_item.added");
+    const reasoning = response.body.indexOf("response.reasoning_summary_text.delta");
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('"type":"reasoning"');
+    expect(added).toBeLessThan(reasoning);
+    expect(response.body).toContain("response.reasoning_summary_text.done");
+  });
+
+  it("ignores previous_response_id and forwards the current input", async () => {
+    const response = await buildServer({
+      commandCodeClient: fakeClient([
+        { type: "text-delta", text: "CONTINUED" },
+        { type: "finish", finishReason: "end_turn" },
+      ]),
+    }).inject({
+      method: "POST",
+      url: "/v1/responses",
+      headers: { authorization: "Bearer request-key" },
+      payload: {
+        model: "deepseek/deepseek-v4-flash",
+        input: "Continue",
         previous_response_id: "resp_previous",
       },
     });
 
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
-      error: { code: "previous_response_id_unsupported" },
+      output: [{ content: [{ text: "CONTINUED" }] }],
     });
   });
 
@@ -228,9 +448,10 @@ describe("POST /v1/responses", () => {
       },
     });
 
-    expect(response.statusCode).toBe(502);
+    // 上游 400 透传为 400：池化网关据此判断是请求问题而非账号故障。
+    expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({
-      error: { type: "api_error", code: "upstream_error" },
+      error: { type: "invalid_request_error", code: "upstream_invalid_request" },
     });
   });
 

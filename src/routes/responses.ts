@@ -4,12 +4,23 @@ import { ZodError } from "zod";
 import { extractCredential } from "../auth.js";
 import {
   CommandCodeUpstreamError,
+  sanitizeForLog,
   type CommandCodeClient,
 } from "../commandcode/client.js";
 import type { ProxyConfig } from "../config.js";
-import { openAiError, upstreamOpenAiError, UpstreamStreamError } from "../errors.js";
+import {
+  openAiError,
+  upstreamErrorMessage,
+  upstreamOpenAiError,
+  UpstreamStreamError,
+} from "../errors.js";
 import { toCommandCodeGenerateRequest } from "../translate/generate-request.js";
-import { toChatRequestFromResponses, toResponse, toResponseEvents } from "../translate/responses.js";
+import {
+  UnsupportedImageFileIdError,
+  toChatRequestFromResponses,
+  toResponse,
+  toResponseEvents,
+} from "../translate/responses.js";
 import { parseResponsesRequest } from "../openai/schemas.js";
 import { materializeRemoteImages } from "../translate/messages.js";
 
@@ -25,6 +36,13 @@ function sendError(reply: FastifyReply, status: number, message: string, code: s
   }));
 }
 
+function logRequestBody(request: FastifyRequest, message: string): void {
+  request.log.info({
+    body: JSON.stringify(sanitizeForLog(request.body)),
+  }, message);
+}
+
+
 export async function registerResponses(
   app: FastifyInstance,
   dependencies: ResponsesRouteDependencies,
@@ -35,16 +53,10 @@ export async function registerResponses(
       return sendError(reply, 401, "Missing CommandCode API credential", "missing_api_key");
     }
 
+    logRequestBody(request, "CommandCode Responses 入站请求参数");
+
     try {
-      const rawBody = parseResponsesRequest(request.body);
-      if (rawBody.previous_response_id) {
-        return sendError(
-          reply,
-          400,
-          "previous_response_id requires a stateful response store",
-          "previous_response_id_unsupported",
-        );
-      }
+      parseResponsesRequest(request.body);
       const body = await materializeRemoteImages(toChatRequestFromResponses(request.body));
       const original = request.body as { stream?: boolean };
       const events = dependencies.commandCodeClient.stream({
@@ -89,7 +101,7 @@ export async function registerResponses(
           }
         } catch (error) {
           if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
-            const mapped = upstreamOpenAiError(error.status);
+            const mapped = upstreamOpenAiError(error.status, upstreamErrorMessage(error instanceof CommandCodeUpstreamError ? error.body : undefined, error.message));
             reply.raw.write(`event: error\ndata: ${JSON.stringify(mapped.body)}\n\n`);
           } else {
             throw error;
@@ -106,12 +118,15 @@ export async function registerResponses(
       }
       return reply.send(toResponse(collected, body.model));
     } catch (error) {
-      if (error instanceof CommandCodeUpstreamError) {
-        const mapped = upstreamOpenAiError(error.status);
-        return reply.code(mapped.status).send(mapped.body);
+      request.log.error({
+        error: error instanceof Error ? error.message : String(error),
+        errorType: error instanceof Error ? error.name : "UnknownError",
+      }, "CommandCode Responses 本地处理失败");
+      if (error instanceof UnsupportedImageFileIdError) {
+        return sendError(reply, 400, error.message, "unsupported_image_file_id");
       }
-      if (error instanceof UpstreamStreamError) {
-        const mapped = upstreamOpenAiError(error.status);
+      if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
+        const mapped = upstreamOpenAiError(error.status, upstreamErrorMessage(error instanceof CommandCodeUpstreamError ? error.body : undefined, error.message));
         return reply.code(mapped.status).send(mapped.body);
       }
       if (error instanceof ZodError || error instanceof Error) {
