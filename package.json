@@ -1,6 +1,8 @@
 {
   "name": "ai-cmd-proxy",
   "version": "0.1.0",
+  "description": "OpenAI-compatible proxy that translates /v1/responses and chat requests into the CommandCode protocol",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "engines": {

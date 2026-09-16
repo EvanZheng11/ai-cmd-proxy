@@ -134,3 +134,7 @@ Responses history items without a `role` — `function_call`,
 `function_call_output`, and `reasoning` — are translated into the equivalent
 assistant/tool messages instead of being dropped, so follow-up requests carry
 the full conversation history the upstream needs to hit its cache.
+
+## License
+
+[MIT](./LICENSE)
