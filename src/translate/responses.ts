@@ -73,6 +73,9 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
     })) as ChatCompletionRequest["messages"];
   }
 
+  // Responses API 允许输入数组里直接混入不带 role 的简写条目
+  // （function_call / function_call_output / reasoning 等）。只按 role 分流的
+  // 实现会把它们整体丢弃，多轮工具调用会丢失全部历史，这里统一转换。
   const messages: ChatCompletionRequest["messages"] = [];
   const userParts: ReturnType<typeof normalizeParts> = [];
   const flushUserParts = () => {
@@ -82,6 +85,11 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
     }
   };
 
+  // Responses API 的输入数组允许三种条目混用：带 role 的 message、
+  // 不带 role 的简写条目（function_call / function_call_output / reasoning），
+  // 以及不带 role 的 message（如 {"role":"user","content":"..."}）。
+  // 只认 type === "message" 会把真实客户端（如 DeepSeek Harness）回传的
+  // 全部历史丢弃，这里按「有无 role」分流而不是按 type 分流。
   for (const item of input as unknown[]) {
     if (!item || typeof item !== "object") {
       continue;
@@ -91,7 +99,8 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
       userParts.push(...normalizeParts([value]));
       continue;
     }
-    if (value.type === "message") {
+    const hasRole = typeof value.role === "string" && value.role.length > 0;
+    if (value.type === "message" || (hasRole && !value.type)) {
       flushUserParts();
       const role = value.role === "user" ? "user" : "assistant";
       const content = Array.isArray(value.content)
@@ -99,6 +108,20 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
         : typeof value.content === "string" ? value.content : [];
       if (typeof content === "string" || content.length > 0) {
         messages.push({ role, content } as ChatCompletionRequest["messages"][number]);
+      }
+      continue;
+    }
+    if (value.type === "reasoning") {
+      flushUserParts();
+      // 汇总文本可以丢弃，但必须留下 assistant 站位，否则上游会看到
+      // "工具调用没有对应的 assistant 发起消息" 的断裂历史。
+      const summaryText = Array.isArray(value.summary)
+        ? (value.summary as Array<Record<string, unknown>>)
+            .map((part) => typeof part?.text === "string" ? part.text : "")
+            .join("")
+        : "";
+      if (summaryText) {
+        messages.push({ role: "assistant", content: summaryText });
       }
       continue;
     }

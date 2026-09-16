@@ -260,6 +260,21 @@ export function createCommandCodeClient(dependencies: ClientDependencies): Comma
   const now = dependencies.now ?? (() => new Date());
   const platform = dependencies.platform ?? (() => process.platform);
   const createSessionId = dependencies.createSessionId ?? randomUUID;
+  // config.workingDir 会随请求体进入上游提示词前缀：每个请求都换随机临时目录
+  // 会让提示词缓存前缀失配（缓存命中永远停在系统提示词那一段）。这里改为
+  // 每个客户端实例首次请求时创建一个固定工作目录，之后所有请求复用同一
+  // 前缀；目录随进程存活，由系统临时目录机制回收。
+  let workingDirPromise: Promise<string> | undefined;
+  const getWorkingDir = (): Promise<string> => {
+    if (!workingDirPromise) {
+      workingDirPromise = createTempDir().catch((error: unknown) => {
+        // 创建失败允许后续请求重试，避免一次临时故障永久阻塞客户端。
+        workingDirPromise = undefined;
+        throw error;
+      });
+    }
+    return workingDirPromise;
+  };
   const logger: CommandCodeLogger = dependencies.logger ?? ((message, context) => {
     console.info(message, context);
   });
@@ -284,11 +299,12 @@ export function createCommandCodeClient(dependencies: ClientDependencies): Comma
 
   return {
     async *stream({ apiKey, request, signal }): AsyncIterable<CommandCodeEvent> {
-      const workingDir = await createTempDir();
       const startedAt = Date.now();
       let sessionId = "";
 
       try {
+        // 放在 try 内：workingDir 创建失败要归一化成 CommandCodeUpstreamError。
+        const workingDir = await getWorkingDir();
         const timeoutSignal = AbortSignal.timeout(dependencies.config.requestTimeoutMs);
         const requestSignal = signal
           ? AbortSignal.any([signal, timeoutSignal])
@@ -383,16 +399,6 @@ export function createCommandCodeClient(dependencies: ClientDependencies): Comma
           isTimeout ? "CommandCode request timed out" : "CommandCode request failed",
           isTimeout ? 504 : 502,
         );
-      } finally {
-        try {
-          await removeTempDir(workingDir);
-        } catch (error) {
-          writeLog("CommandCode 临时目录清理失败", {
-            model: request.params.model,
-            sessionId,
-            error: error instanceof Error ? error.name : "UnknownError",
-          });
-        }
       }
     },
   };

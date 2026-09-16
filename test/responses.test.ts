@@ -143,6 +143,78 @@ describe("POST /v1/responses", () => {
     });
   });
 
+  it("keeps role-less shorthand items (function_call/output, reasoning) in history", () => {
+    // DeepSeek Harness 等下游会把历史作为不带 role 的简写条目回传：
+    // function_call / function_call_output / reasoning。只按 role 分流的实现
+    // 会把它们全部丢弃，第二轮起上游就看不到完整历史。
+    const result = toChatRequestFromResponses({
+      model: "deepseek/deepseek-v4.1-flash",
+      input: [
+        {
+          role: "system",
+          content: "You are an AI agent.",
+        },
+        { role: "user", content: "第一轮问题" },
+        {
+          type: "function_call",
+          call_id: "call_00_abc",
+          name: "bash",
+          arguments: "{\"command\":\"ls\"}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_00_abc",
+          output: "file-a\nfile-b",
+        },
+        {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "先看目录结构" }],
+        },
+        {
+          type: "function_call",
+          call_id: "call_01_def",
+          name: "read",
+          arguments: "{\"file_path\":\"a.ts\"}",
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_01_def",
+          output: "content",
+        },
+        { role: "user", content: "继续" },
+      ],
+    });
+
+    // 无 type 的 {"role":"user","content":...} 走 message 转换；
+    // system/developer 会在后续 toCommandCodeMessages 里合并为 system。
+    expect(result.messages).toEqual([
+      { role: "assistant", content: "You are an AI agent." },
+      { role: "user", content: "第一轮问题" },
+      {
+        role: "assistant",
+        tool_calls: [{
+          id: "call_00_abc",
+          type: "function",
+          function: { name: "bash", arguments: "{\"command\":\"ls\"}" },
+        }],
+      },
+      { role: "tool", tool_call_id: "call_00_abc", content: "file-a\nfile-b" },
+      // reasoning 留下的 assistant 消息会承接下一个 function_call，
+      // 工具调用与发起消息不拆开，上游看到的历史才是连续的。
+      {
+        role: "assistant",
+        content: "先看目录结构",
+        tool_calls: [{
+          id: "call_01_def",
+          type: "function",
+          function: { name: "read", arguments: "{\"file_path\":\"a.ts\"}" },
+        }],
+      },
+      { role: "tool", tool_call_id: "call_01_def", content: "content" },
+      { role: "user", content: "继续" },
+    ]);
+  });
+
   it("normalizes flat Responses function tools", () => {
     const result = toChatRequestFromResponses({
       model: "deepseek/deepseek-v4-flash",
@@ -482,6 +554,7 @@ describe("POST /v1/responses", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain('event: error');
-    expect(removeTempDir).toHaveBeenCalledWith("/tmp/ai-cmd-proxy-test");
+    // 固定 workingDir 与客户端实例同生命周期，不再按请求清理。
+    expect(removeTempDir).not.toHaveBeenCalled();
   });
 });

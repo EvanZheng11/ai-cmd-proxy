@@ -114,7 +114,30 @@ describe("CommandCode client", () => {
       recentCommits: [],
     });
     expect(createTempDir).toHaveBeenCalledOnce();
-    expect(removeTempDir).toHaveBeenCalledWith("/tmp/ai-cmd-proxy-random");
+    expect(removeTempDir).not.toHaveBeenCalled();
+  });
+
+  it("reuses one working directory across requests for cache-prefix stability", async () => {
+    // 每次请求都要拿到独立的 Response 实例（body 只能消费一次）。
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(
+      new Response('{"type":"finish","finishReason":"end_turn"}\n', { status: 200 }),
+    ));
+    const createTempDir = vi.fn()
+      .mockResolvedValueOnce("/tmp/ai-cmd-proxy-first")
+      .mockResolvedValue("/tmp/ai-cmd-proxy-second");
+    const client = createCommandCodeClient({
+      config: loadConfig({}),
+      fetch: fetchMock,
+      createTempDir,
+      removeTempDir: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await collect(client.stream({ apiKey: "k", request: sampleRequest }));
+    await collect(client.stream({ apiKey: "k", request: sampleRequest }));
+
+    expect(createTempDir).toHaveBeenCalledOnce();
+    const second = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body));
+    expect(second.config.workingDir).toBe("/tmp/ai-cmd-proxy-first");
   });
 
   it("caps the default max tokens at CommandCode's validation limit", async () => {
@@ -448,7 +471,8 @@ describe("CommandCode client", () => {
       { type: "finish", finishReason: "end_turn" },
     ]);
 
-    expect(removeTempDir).toHaveBeenCalledWith("/tmp/ai-cmd-proxy-random");
+    // 固定 workingDir 的生命周期与客户端实例一致，日志故障不应触发清理。
+    expect(removeTempDir).not.toHaveBeenCalled();
   });
 
   it("cleans up when session creation fails", async () => {
@@ -459,7 +483,7 @@ describe("CommandCode client", () => {
         throw new Error("session creation failed");
       }),
       createTempDir: vi.fn().mockResolvedValue("/tmp/ai-cmd-proxy-random"),
-      removeTempDir,
+      removeTempDir: vi.fn().mockResolvedValue(undefined),
     });
 
     await expect(collect(client.stream({
@@ -470,15 +494,15 @@ describe("CommandCode client", () => {
       status: 502,
     });
 
-    expect(removeTempDir).toHaveBeenCalledWith("/tmp/ai-cmd-proxy-random");
+    // 固定 workingDir 不再随请求清理。
+    expect(removeTempDir).not.toHaveBeenCalled();
   });
-
   it("preserves the upstream error when temporary directory cleanup fails", async () => {
     const client = createCommandCodeClient({
       config: loadConfig({}),
       fetch: vi.fn().mockResolvedValue(new Response("not-json\n", { status: 200 })),
-      createTempDir: vi.fn().mockResolvedValue("/tmp/ai-cmd-proxy-random"),
-      removeTempDir: vi.fn().mockRejectedValue(new Error("cleanup failed")),
+      createTempDir: vi.fn().mockRejectedValue(new Error("mkdtemp failed")),
+      removeTempDir: vi.fn().mockResolvedValue(undefined),
       logger: vi.fn(),
     });
 
@@ -489,6 +513,31 @@ describe("CommandCode client", () => {
       name: "CommandCodeUpstreamError",
       status: 502,
     });
+  });
+
+  it("retries working directory creation after a failed attempt", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response('{"type":"finish","finishReason":"end_turn"}\n', { status: 200 }),
+    );
+    const createTempDir = vi.fn()
+      .mockRejectedValueOnce(new Error("mkdtemp failed"))
+      .mockResolvedValue("/tmp/ai-cmd-proxy-recovered");
+    const client = createCommandCodeClient({
+      config: loadConfig({}),
+      fetch: fetchMock,
+      createTempDir,
+      removeTempDir: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(collect(client.stream({
+      apiKey: "k",
+      request: sampleRequest,
+    }))).rejects.toMatchObject({ name: "CommandCodeUpstreamError" });
+    await collect(client.stream({ apiKey: "k", request: sampleRequest }));
+
+    expect(createTempDir).toHaveBeenCalledTimes(2);
+    const payload = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(payload.config.workingDir).toBe("/tmp/ai-cmd-proxy-recovered");
   });
 
   it("logs request failures without exposing the api key", async () => {

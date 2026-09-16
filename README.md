@@ -119,6 +119,18 @@ system string with `\n\n` between messages (including empty messages) and `\n`
 between text blocks. Original role boundaries and positions relative to other
 messages cannot be represented by this protocol. Text whitespace is not trimmed.
 Tool and image conversion remains unchanged, including downloading remote images
-as base64. Session IDs, environment config, and cache usage reporting are unchanged.
-This is not a byte-for-byte relay and does not guarantee improved cache hit rates;
-cache hits are determined by the upstream provider.
+as base64. This is not a byte-for-byte relay and does not guarantee improved
+cache hit rates; cache hits are determined by the upstream provider.
+
+## Cache Stability
+
+CommandCode prompt caching matches on the request prefix, and `config` is part
+of the upstream payload. The proxy therefore keeps one fixed `workingDir` per
+client instance (created on first request, reused afterwards) instead of a
+random temp directory per request, so multi-turn conversations keep a stable
+prefix and cached tokens can actually be reused.
+
+Responses history items without a `role` — `function_call`,
+`function_call_output`, and `reasoning` — are translated into the equivalent
+assistant/tool messages instead of being dropped, so follow-up requests carry
+the full conversation history the upstream needs to hit its cache.
