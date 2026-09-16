@@ -1,7 +1,7 @@
 # AI CommandCode Proxy
 
 An OpenAI-compatible HTTP proxy for CommandCode.
-用于代理 CommandCode Go Plan，因为它不用使用官方开放出来的API接口，导致无法将它接入其他Agent，必须在CommandCode里使用。
+用于代理 CommandCode Go Plan，因为它不能使用官方开放出来的API接口，导致无法将它接入其他Agent，必须在CommandCode里使用。但它$1可以使用$10的额度，挺划算的，多注册几个号代理到中转站自动切换还是不错的。
 
 ## Run
 
