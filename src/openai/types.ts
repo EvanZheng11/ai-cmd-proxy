@@ -21,6 +21,7 @@ export type OpenAiTool = {
 export type OpenAiChatMessage = {
   role: "system" | "developer" | "user" | "assistant" | "tool";
   content?: string | OpenAiContentPart[] | null;
+  reasoning_content?: string | null;
   name?: string;
   tool_call_id?: string;
   tool_calls?: Array<{
@@ -55,6 +56,15 @@ export type ChatCompletionRequest = {
   };
 };
 
+export type ResponsesFunctionTool = OpenAiTool | ({ type: "function" } & OpenAiTool["function"]);
+
+export type ResponsesTool = ResponsesFunctionTool | {
+  type: "namespace";
+  name: string;
+  description?: string;
+  tools: ResponsesFunctionTool[];
+};
+
 export type ResponsesRequest = {
   model: string;
   input: string | OpenAiChatMessage[] | OpenAiContentPart[] | unknown[];
@@ -66,7 +76,7 @@ export type ResponsesRequest = {
   reasoning?: {
     effort?: string;
   };
-  tools?: OpenAiTool[];
+  tools?: ResponsesTool[];
   text?: {
     format?: Record<string, unknown>;
   };

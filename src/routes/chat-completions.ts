@@ -2,127 +2,97 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ZodError } from "zod";
 
 import { extractCredential } from "../auth.js";
-import {
-  CommandCodeUpstreamError,
-  type CommandCodeClient,
-} from "../commandcode/client.js";
+import { CommandCodeUpstreamError, sanitizeForLog, type CommandCodeClient } from "../commandcode/client.js";
+import type { CommandCodeEvent } from "../commandcode/types.js";
 import type { ProxyConfig } from "../config.js";
-import {
-  openAiError,
-  upstreamErrorMessage,
-  upstreamOpenAiError,
-  UpstreamStreamError,
-} from "../errors.js";
+import { openAiError, validationError, UpstreamStreamError } from "../errors.js";
 import { parseChatCompletionRequest } from "../openai/schemas.js";
 import { toCommandCodeGenerateRequest } from "../translate/generate-request.js";
 import { materializeRemoteImages } from "../translate/messages.js";
 import { toChatCompletion, toChatCompletionChunks } from "../translate/chat.js";
+import { logRouteError, preRead, remainingEvents, streamError, watchDisconnect } from "./stream-lifecycle.js";
 
 type ChatRouteDependencies = {
   commandCodeClient: CommandCodeClient;
   config: ProxyConfig;
 };
 
-function sendError(reply: FastifyReply, status: number, message: string, code: string) {
+function sendError(reply: FastifyReply, status: number, message: string, code: string, param: string | null = null) {
   return reply.code(status).send(openAiError(status, message, {
     type: status === 401 ? "authentication_error" : "invalid_request_error",
     code,
+    param,
   }));
 }
 
-
-export async function registerChatCompletions(
-  app: FastifyInstance,
-  dependencies: ChatRouteDependencies,
-): Promise<void> {
+export async function registerChatCompletions(app: FastifyInstance, dependencies: ChatRouteDependencies): Promise<void> {
   app.post("/v1/chat/completions", async (request: FastifyRequest, reply: FastifyReply) => {
+    reply.header("x-request-id", request.id);
     const apiKey = extractCredential(request.headers);
-    if (!apiKey) {
-      return sendError(reply, 401, "Missing CommandCode API credential", "missing_api_key");
-    }
+    if (!apiKey) return sendError(reply, 401, "Missing CommandCode API credential", "missing_api_key");
 
-    let body;
+    const lifecycle = watchDisconnect(reply);
+    let iterator: AsyncIterator<CommandCodeEvent> | undefined;
     try {
-      body = parseChatCompletionRequest(request.body);
-    } catch (error) {
-      if (error instanceof ZodError) {
-        return sendError(reply, 400, error.issues[0]?.message ?? "Invalid request", "invalid_request");
-      }
-      throw error;
-    }
-
-    try {
+      const body = parseChatCompletionRequest(request.body);
       const hydratedBody = await materializeRemoteImages(body);
-      const commandRequest = toCommandCodeGenerateRequest(hydratedBody, {
-        defaultMaxTokens: dependencies.config.defaultMaxTokens,
-      });
-      const events = dependencies.commandCodeClient.stream({
+      if (!lifecycle.canWrite()) return;
+      request.log.info(sanitizeForLog({ requestId: request.id, model: body.model, stream: !!body.stream }, "", [apiKey]), "CommandCode Chat 请求开始");
+      iterator = dependencies.commandCodeClient.stream({
         apiKey,
-        request: commandRequest,
-      });
+        requestId: request.id,
+        signal: lifecycle.signal,
+        request: toCommandCodeGenerateRequest(hydratedBody, { defaultMaxTokens: dependencies.config.defaultMaxTokens }),
+      })[Symbol.asyncIterator]();
 
       if (body.stream) {
-        // Read the first upstream result before committing the HTTP status.
-        // A rejected iterator means CommandCode returned an HTTP/transport error.
-        const iterator = events[Symbol.asyncIterator]();
-        const first = await iterator.next();
-        const bufferedEvents = (async function* () {
-          try {
-            if (first.done) {
-              return;
-            }
-            yield first.value;
-            while (true) {
-              const next = await iterator.next();
-              if (next.done) {
-                return;
-              }
-              yield next.value;
-            }
-          } finally {
-            await iterator.return?.();
-          }
-        })();
-
+        const first = await preRead(iterator);
+        if (!lifecycle.canWrite()) return;
         reply.hijack();
         reply.raw.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache",
           connection: "keep-alive",
+          "x-request-id": request.id,
         });
-
         try {
-          for await (const chunk of toChatCompletionChunks(bufferedEvents, body)) {
+          for await (const chunk of toChatCompletionChunks(remainingEvents(iterator, first), body)) {
+            if (!lifecycle.canWrite()) break;
             reply.raw.write(chunk);
           }
         } catch (error) {
-          if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
-            const mapped = upstreamOpenAiError(error.status, upstreamErrorMessage(error instanceof CommandCodeUpstreamError ? error.body : undefined, error.message));
+          logRouteError(request, error, apiKey, "CommandCode Chat 流式处理失败");
+          if (lifecycle.canWrite()) {
+            const mapped = streamError(error);
             reply.raw.write(`data: ${JSON.stringify(mapped.body)}\n\n`);
             reply.raw.write("data: [DONE]\n\n");
-          } else {
-            throw error;
           }
         } finally {
-          reply.raw.end();
+          if (lifecycle.canWrite()) reply.raw.end();
         }
         return;
       }
 
       const collected = [];
-      for await (const event of events) {
-        collected.push(event);
-      }
-      return reply.send(toChatCompletion(collected, body));
+      for await (const event of remainingEvents(iterator)) collected.push(event);
+      if (lifecycle.canWrite()) return reply.send(toChatCompletion(collected, body));
     } catch (error) {
-      if (error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
-        const mapped = upstreamOpenAiError(error.status, upstreamErrorMessage(error instanceof CommandCodeUpstreamError ? error.body : undefined, error.message));
+      logRouteError(request, error, apiKey, "CommandCode Chat 本地处理失败");
+      if (!lifecycle.canWrite()) return;
+      if (iterator || error instanceof CommandCodeUpstreamError || error instanceof UpstreamStreamError) {
+        const mapped = streamError(error);
         return reply.code(mapped.status).send(mapped.body);
       }
-      if (error instanceof Error) {
-        return sendError(reply, 400, error.message, "invalid_request");
+      if (error instanceof ZodError) {
+        const detail = validationError(error, request.body);
+        return sendError(reply, 400, detail.message, "invalid_request", detail.param);
       }
+      if (error instanceof Error) return sendError(reply, 400, error.message, "invalid_request");
       throw error;
+    } finally {
+      try { await iterator?.return?.(); }
+      catch (error) { logRouteError(request, error, apiKey, "CommandCode Chat 流清理失败"); }
+      finally { lifecycle.cleanup(); }
     }
   });
 }

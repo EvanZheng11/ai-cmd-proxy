@@ -1,10 +1,68 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
-import { parseResponsesRequest } from "../openai/schemas.js";
-import type { ChatCompletionRequest, OpenAiContentPart, ResponsesRequest } from "../openai/types.js";
+import { parseResponsesRequest, parseResponsesTools, ResponsesTranslationError } from "../openai/schemas.js";
+import type { ChatCompletionRequest, OpenAiChatMessage, OpenAiContentPart, OpenAiTool, ResponsesRequest } from "../openai/types.js";
 import type { CommandCodeEvent } from "../commandcode/types.js";
 import { eventStatusCode, UpstreamStreamError } from "../errors.js";
 import { toCommandCodeGenerateRequest } from "./generate-request.js";
+
+export { ResponsesTranslationError } from "../openai/schemas.js";
+
+export type ResponsesToolNameMap = ReadonlyMap<string, { name: string; namespace?: string }>;
+export type ResponsesOutputOptions = { toolNameMap?: ResponsesToolNameMap };
+
+function flattenTools(tools: ResponsesRequest["tools"] = []) {
+  return tools.flatMap<{ fn: OpenAiTool["function"]; namespace: string | undefined; param: string }>((tool, index) => {
+    if (tool.type === "namespace") {
+      return tool.tools.map((child, childIndex) => ({
+        fn: "function" in child ? child.function : child,
+        namespace: tool.name,
+        param: `tools[${index}].tools[${childIndex}].${"function" in child ? "function." : ""}name`,
+      }));
+    }
+    return [{
+      fn: "function" in tool ? tool.function : tool,
+      namespace: undefined,
+      param: `tools[${index}].${"function" in tool ? "function." : ""}name`,
+    }];
+  });
+}
+
+// 请求级映射由路由传给输出转换器；相同工具集合与输入顺序无关。
+export function buildResponsesToolNameMap(tools: unknown = []): ResponsesToolNameMap {
+  const entries = flattenTools(parseResponsesTools(tools));
+  const identities = new Set<string>();
+  for (const entry of entries) {
+    const key = JSON.stringify([entry.namespace, entry.fn.name]);
+    if (identities.has(key)) {
+      throw new ResponsesTranslationError("工具名称重复", entry.param, "duplicate_tool_name");
+    }
+    identities.add(key);
+  }
+  const map = new Map<string, { name: string; namespace?: string }>();
+  for (const { fn, namespace } of entries) {
+    if (namespace === undefined) map.set(fn.name, { name: fn.name });
+  }
+  const namespaced = entries.filter((entry) => entry.namespace !== undefined)
+    .sort((a, b) => JSON.stringify([a.namespace, a.fn.name]).localeCompare(JSON.stringify([b.namespace, b.fn.name])));
+  for (const { fn, namespace } of namespaced) {
+    const base = `ns_${createHash("sha256").update(JSON.stringify([namespace, fn.name])).digest("hex").slice(0, 48)}`;
+    let name = base;
+    for (let suffix = 1; map.has(name); suffix++) name = `${base}_${suffix}`;
+    map.set(name, { name: fn.name, namespace });
+  }
+  return map;
+}
+
+function upstreamToolName(name: string, namespace: string | undefined, map: ResponsesToolNameMap, param: string): string {
+  for (const [alias, original] of map) {
+    if (original.name === name && original.namespace === namespace) return alias;
+  }
+  if (namespace !== undefined) {
+    throw new ResponsesTranslationError("找不到 namespace 函数定义", param, "unknown_tool_name");
+  }
+  return name;
+}
 
 type ResponseState = {
   text: string;
@@ -33,7 +91,7 @@ export class UnsupportedImageFileIdError extends Error {
   }
 }
 
-function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest["messages"] {
+function normalizeInput(input: ResponsesRequest["input"], toolNameMap: ResponsesToolNameMap): ChatCompletionRequest["messages"] {
   const normalizeParts = (parts: unknown[], output = false): OpenAiContentPart[] => parts.flatMap<OpenAiContentPart>((part) => {
     if (!part || typeof part !== "object") {
       return [];
@@ -64,19 +122,29 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
     return [{ role: "user" as const, content: input }];
   }
 
-  if (Array.isArray(input) && input.every((item) => typeof item === "object" && item !== null && "role" in item)) {
-    return (input as Array<Record<string, unknown>>).map((message) => ({
-      ...message,
-      ...(Array.isArray(message.content)
-        ? { content: normalizeParts(message.content, message.role === "assistant") }
-        : {}),
-    })) as ChatCompletionRequest["messages"];
-  }
-
   // Responses API 允许输入数组里直接混入不带 role 的简写条目
   // （function_call / function_call_output / reasoning 等）。只按 role 分流的
   // 实现会把它们整体丢弃，多轮工具调用会丢失全部历史，这里统一转换。
   const messages: ChatCompletionRequest["messages"] = [];
+  const appendMessage = (message: OpenAiChatMessage) => {
+    const last = messages.at(-1);
+    if (last?.role !== "assistant" || message.role !== "assistant") {
+      messages.push(message);
+      return;
+    }
+    // 同一轮 Responses 可以把推理、正文和工具分为多个条目；工具结果前不能插入新 assistant。
+    if (message.content) {
+      if (!last.content || last.content.length === 0) last.content = message.content;
+      else if (typeof last.content === "string" && typeof message.content === "string") last.content += message.content;
+      else {
+        const parts = (content: NonNullable<OpenAiChatMessage["content"]>): OpenAiContentPart[] =>
+          typeof content === "string" ? [{ type: "text", text: content }] : content;
+        last.content = [...parts(last.content), ...parts(message.content)];
+      }
+    }
+    if (message.reasoning_content) last.reasoning_content = (last.reasoning_content ?? "") + message.reasoning_content;
+    if (message.tool_calls) last.tool_calls = [...(last.tool_calls ?? []), ...message.tool_calls];
+  };
   const userParts: ReturnType<typeof normalizeParts> = [];
   const flushUserParts = () => {
     if (userParts.length > 0) {
@@ -90,9 +158,10 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
   // 以及不带 role 的 message（如 {"role":"user","content":"..."}）。
   // 只认 type === "message" 会把真实客户端（如 DeepSeek Harness）回传的
   // 全部历史丢弃，这里按「有无 role」分流而不是按 type 分流。
-  for (const item of input as unknown[]) {
+  for (const [index, item] of (input as unknown[]).entries()) {
+    const param = `input[${index}]`;
     if (!item || typeof item !== "object") {
-      continue;
+      throw new ResponsesTranslationError("输入条目必须是对象", param, "unsupported_input_item");
     }
     const value = item as Record<string, unknown>;
     if (value.type === "input_text" || value.type === "input_image") {
@@ -102,28 +171,40 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
     const hasRole = typeof value.role === "string" && value.role.length > 0;
     if (value.type === "message" || (hasRole && !value.type)) {
       flushUserParts();
-      const role = value.role === "user" ? "user" : "assistant";
+      const role = value.role as OpenAiChatMessage["role"];
+      if (!["user", "assistant", "system", "developer", "tool"].includes(role)) {
+        throw new ResponsesTranslationError("不支持的消息角色", `${param}.role`, "unsupported_input_item");
+      }
       const content = Array.isArray(value.content)
         ? normalizeParts(value.content, role === "assistant")
         : typeof value.content === "string" ? value.content : [];
-      if (typeof content === "string" || content.length > 0) {
-        messages.push({ role, content } as ChatCompletionRequest["messages"][number]);
-      }
+      const { type: _type, id: _id, status: _status, ...message } = value;
+      appendMessage({ ...message, role, content } as OpenAiChatMessage);
       continue;
     }
     if (value.type === "reasoning") {
       flushUserParts();
-      // 汇总文本可以丢弃，但必须留下 assistant 站位，否则上游会看到
-      // "工具调用没有对应的 assistant 发起消息" 的断裂历史。
       const summaryText = Array.isArray(value.summary)
         ? (value.summary as Array<Record<string, unknown>>)
             .map((part) => typeof part?.text === "string" ? part.text : "")
             .join("")
         : "";
       if (summaryText) {
-        messages.push({ role: "assistant", content: summaryText });
+        appendMessage({ role: "assistant", reasoning_content: summaryText });
       }
       continue;
+    }
+    if (value.type === "function_call" || value.type === "function_call_output") {
+      const stringFields = value.type === "function_call" ? ["call_id", "name"] : ["call_id"];
+      for (const field of stringFields) {
+        if (typeof value[field] !== "string" || !value[field]) {
+          throw new ResponsesTranslationError("工具历史字段必须是非空字符串", `${param}.${field}`, "invalid_tool_history");
+        }
+      }
+      const payload = value.type === "function_call" ? "arguments" : "output";
+      if (value[payload] === undefined) {
+        throw new ResponsesTranslationError("缺少工具历史字段", `${param}.${payload}`, "invalid_tool_history");
+      }
     }
     if (value.type === "function_call") {
       flushUserParts();
@@ -131,18 +212,13 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
           id: String(value.call_id ?? ""),
           type: "function",
           function: {
-            name: String(value.name ?? ""),
+            name: upstreamToolName(String(value.name ?? ""), typeof value.namespace === "string" ? value.namespace : undefined, toolNameMap, `${param}.name`),
             arguments: typeof value.arguments === "string"
               ? value.arguments
               : JSON.stringify(value.arguments ?? {}),
           },
         } as const;
-      const last = messages.at(-1);
-      if (last?.role === "assistant") {
-        last.tool_calls = [...(last.tool_calls ?? []), toolCall];
-      } else {
-        messages.push({ role: "assistant", tool_calls: [toolCall] });
-      }
+      appendMessage({ role: "assistant", tool_calls: [toolCall] });
       continue;
     }
     if (value.type === "function_call_output") {
@@ -150,9 +226,11 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
       messages.push({
         role: "tool",
         tool_call_id: String(value.call_id ?? ""),
-        content: typeof value.output === "string" ? value.output : JSON.stringify(value.output ?? {}),
+        content: typeof value.output === "string" ? value.output : JSON.stringify(value.output),
       });
+      continue;
     }
+    throw new ResponsesTranslationError(`不支持输入条目类型 ${String(value.type)}`, `${param}.type`, "unsupported_input_item");
   }
 
   flushUserParts();
@@ -161,6 +239,7 @@ function normalizeInput(input: ResponsesRequest["input"]): ChatCompletionRequest
 
 export function toChatRequestFromResponses(input: unknown): ChatCompletionRequest {
   const request = parseResponsesRequest(input);
+  const toolNameMap = buildResponsesToolNameMap(request.tools);
   if (request.text?.format !== undefined && request.text.format.type !== "text") {
     throw new Error("Structured output is not supported by the CommandCode upstream");
   }
@@ -170,7 +249,7 @@ export function toChatRequestFromResponses(input: unknown): ChatCompletionReques
       ...(request.instructions !== undefined
         ? [{ role: "system" as const, content: request.instructions }]
         : []),
-      ...normalizeInput(request.input),
+      ...normalizeInput(request.input, toolNameMap),
     ],
     ...(request.stream === undefined ? {} : { stream: request.stream }),
     ...(request.max_output_tokens === undefined
@@ -184,17 +263,15 @@ export function toChatRequestFromResponses(input: unknown): ChatCompletionReques
     ...(request.tools === undefined
       ? {}
       : {
-          tools: request.tools.map((tool) => "function" in tool
-            ? tool
-            : {
-                type: "function" as const,
-                function: {
-                  name: tool.name,
-                  description: tool.description,
-                  parameters: tool.parameters,
-                  strict: tool.strict,
-                },
-              }),
+          tools: flattenTools(request.tools).map(({ fn, namespace, param }): OpenAiTool => ({
+            type: "function",
+            function: {
+              name: upstreamToolName(fn.name, namespace, toolNameMap, param),
+              description: fn.description,
+              parameters: fn.parameters,
+              strict: fn.strict,
+            },
+          })),
         }),
   };
 }
@@ -269,7 +346,7 @@ function responseSkeleton(id: string, model: string) {
   };
 }
 
-export function toResponse(events: CommandCodeEvent[], model: string) {
+export function toResponse(events: CommandCodeEvent[], model: string, options: ResponsesOutputOptions = {}) {
   const id = `resp_${randomUUID()}`;
   const state = collectState(events);
   const response = responseSkeleton(id, model);
@@ -301,7 +378,7 @@ export function toResponse(events: CommandCodeEvent[], model: string) {
       type: "function_call" as const,
       status: "completed" as const,
       call_id: call.id,
-      name: call.name,
+      ...(options.toolNameMap?.get(call.name) ?? { name: call.name }),
       arguments: call.arguments,
     });
   }
@@ -316,6 +393,7 @@ export function toResponse(events: CommandCodeEvent[], model: string) {
 export async function* toResponseEvents(
   events: AsyncIterable<CommandCodeEvent>,
   model: string,
+  options: ResponsesOutputOptions = {},
 ): AsyncIterable<string> {
   const id = `resp_${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -418,7 +496,7 @@ export async function* toResponseEvents(
       });
     } else if (event.type === "tool-call") {
       const callId = event.toolCallId ?? `call_${randomUUID()}`;
-      const name = event.toolName ?? "";
+      const original = options.toolNameMap?.get(event.toolName ?? "") ?? { name: event.toolName ?? "" };
       const args = typeof event.input === "string"
         ? event.input
         : JSON.stringify(event.input ?? event.args ?? {});
@@ -431,7 +509,7 @@ export async function* toResponseEvents(
           type: "function_call",
           status: "in_progress",
           call_id: callId,
-          name,
+          ...original,
           arguments: "",
         },
       });
@@ -445,16 +523,18 @@ export async function* toResponseEvents(
         output_index: outputIndex,
         arguments: args,
       });
+      const item = {
+        id: itemId,
+        type: "function_call",
+        status: "completed",
+        call_id: callId,
+        ...original,
+        arguments: args,
+      };
+      output[outputIndex] = item;
       yield emit("response.output_item.done", {
         output_index: outputIndex,
-        item: {
-          id: itemId,
-          type: "function_call",
-          status: "completed",
-          call_id: callId,
-          name,
-          arguments: args,
-        },
+        item,
       });
     } else if (event.type === "finish") {
       usage = usageFromEvent(event);
@@ -484,7 +564,7 @@ export async function* toResponseEvents(
       output_index: reasoningOutputIndex!,
       item,
     });
-    output.push(item);
+    output[reasoningOutputIndex!] = item;
   }
   if (!messageId && output.length === 0) {
     for (const chunk of addMessage()) {
@@ -515,7 +595,7 @@ export async function* toResponseEvents(
       output_index: messageOutputIndex!,
       item,
     });
-    output.push(item);
+    output[messageOutputIndex!] = item;
   }
   yield emit("response.completed", {
     response: {

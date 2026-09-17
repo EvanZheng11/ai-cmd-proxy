@@ -17,6 +17,7 @@ type Usage = {
 
 type ChatState = {
   text: string;
+  reasoning: string;
   toolCalls: Array<{
     id: string;
     name: string;
@@ -68,6 +69,7 @@ function finishReasonFromEvent(event: CommandCodeEvent, hasToolCalls: boolean): 
 export function aggregateChatEvents(events: CommandCodeEvent[]): ChatState {
   const state: ChatState = {
     text: "",
+    reasoning: "",
     toolCalls: [],
     finishReason: "stop",
   };
@@ -81,6 +83,8 @@ export function aggregateChatEvents(events: CommandCodeEvent[]): ChatState {
       throw new UpstreamStreamError(message, eventStatusCode(event));
     } else if (event.type === "text-delta") {
       state.text += event.text ?? "";
+    } else if (event.type === "reasoning-delta") {
+      state.reasoning += event.text ?? "";
     } else if (event.type === "tool-call") {
       state.toolCalls.push({
         id: event.toolCallId ?? `call_${randomUUID()}`,
@@ -112,6 +116,7 @@ export function toChatCompletion(
   const message = {
     role: "assistant" as const,
     content: state.text || null,
+    ...(state.reasoning ? { reasoning_content: state.reasoning } : {}),
     ...(state.toolCalls.length > 0
       ? {
           tool_calls: state.toolCalls.map((call) => ({
@@ -175,6 +180,14 @@ export async function* toChatCompletionChunks(
         created,
         model: request.model,
         choices: [{ index: 0, delta: { content: event.text }, finish_reason: null }],
+      });
+    } else if (event.type === "reasoning-delta" && event.text) {
+      yield emit({
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: request.model,
+        choices: [{ index: 0, delta: { reasoning_content: event.text }, finish_reason: null }],
       });
     } else if (event.type === "tool-call") {
       sawToolCall = true;

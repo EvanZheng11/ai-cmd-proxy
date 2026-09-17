@@ -210,13 +210,14 @@ describe("CommandCode client", () => {
       url: "https://api.commandcode.ai/alpha/generate",
       method: "POST",
       headers: expect.objectContaining({ authorization: "[REDACTED]" }),
-      body: expect.stringContaining(`"model":"${sampleRequest.params.model}"`),
+      model: sampleRequest.params.model,
     });
     expect(responseLog?.[1]).toMatchObject({
       status: 400,
       headers: expect.objectContaining({ "x-request-id": "upstream-request-1" }),
-      body: expect.stringContaining("Invalid input"),
     });
+    expect(requestLog?.[1]).not.toHaveProperty("body");
+    expect(responseLog?.[1]).not.toHaveProperty("body");
     expect(JSON.stringify(logger.mock.calls)).not.toContain("request-secret");
   });
 
@@ -252,10 +253,10 @@ describe("CommandCode client", () => {
 
     expect(logger.mock.calls).toContainEqual([
       "CommandCode 图片参数摘要",
-      {
+      expect.objectContaining({
         imageCount: 1,
         images: [{ mediaType: "image/png", base64Length: 8 }],
-      },
+      }),
     ]);
     expect(JSON.stringify(logger.mock.calls)).not.toContain("aGVsbG8=");
   });
@@ -407,17 +408,12 @@ describe("CommandCode client", () => {
       "CommandCode 上游请求参数",
       "CommandCode 上游响应详情",
       "CommandCode 响应已收到",
-      "CommandCode 上游响应体",
-      "CommandCode 缓存命中统计",
+      "CommandCode 请求完成",
     ]);
-    await vi.waitFor(() => {
-      expect(logger.mock.calls).toContainEqual([
-        "CommandCode 上游响应体",
-        expect.objectContaining({
-          body: expect.stringContaining('"text":"OK"'),
-        }),
-      ]);
-    });
+    expect(logger.mock.calls).toContainEqual([
+      "CommandCode 请求完成",
+      expect.objectContaining({ eventsReceived: 2 }),
+    ]);
     expect(JSON.stringify(logger.mock.calls)).not.toContain("request-secret");
   });
 
@@ -441,7 +437,7 @@ describe("CommandCode client", () => {
 
     expect(logger.mock.calls).toContainEqual([
       "CommandCode 缓存命中统计",
-      { inputTokens: 4367, cachedInputTokens: 4224, cacheHitRate: "97%" },
+      expect.objectContaining({ inputTokens: 4367, cachedInputTokens: 4224, cacheHitRate: "97%" }),
     ]);
   });
 

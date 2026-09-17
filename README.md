@@ -103,7 +103,7 @@ HOST=127.0.0.1
 PORT=3000
 COMMAND_CODE_API_URL=https://api.commandcode.ai
 COMMAND_CODE_VERSION=1.36.0
-DEFAULT_MAX_TOKENS=1000000
+DEFAULT_MAX_TOKENS=32000
 REQUEST_TIMEOUT_MS=600000
 MAX_REQUEST_BYTES=20971520
 ```
@@ -135,6 +135,18 @@ Responses history items without a `role` — `function_call`,
 `function_call_output`, and `reasoning` — are translated into the equivalent
 assistant/tool messages instead of being dropped, so follow-up requests carry
 the full conversation history the upstream needs to hit its cache.
+
+## 稳定性与兼容范围
+
+代理对尚未输出任何上游事件的瞬时连接异常和 HTTP 502/503/504 最多尝试三次，使用退避和同一个 `REQUEST_TIMEOUT_MS` 总预算。400/401/403、未知异常、主动取消及已经开始的流不会自动重放。上游容量错误仍可能需要 sub2api 切换可用渠道。
+
+响应头的 `x-request-id` 与代理日志的 `requestId` 对应。失败日志包含 `attempt`、`stage`、`eventsReceived`、`durationMs`、`errorMessage`、`causeCode`，不再记录完整请求和响应正文。首个有效输出之前的错误返回真实 HTTP 状态；Responses 流中错误以同一响应 ID 的 `response.failed` 结束，并携带 `error.status_code`。客户端断开会取消上游生成。
+
+Responses 的最终 `output` 保留全部工具调用及其顺序、ID，不再为纯工具调用追加空 assistant 消息。工具结果前的同轮 assistant 条目会合并，推理文本以原生 reasoning 块传回上游；Chat Completions 支持 `reasoning_content`。加密推理内容不在支持范围内。
+
+支持普通 function 工具和 namespace 内的 function 工具；namespace 名称在上游展开，返回时还原，后续请求需携带对应工具定义。`web_search`、`image_generation`、custom 及嵌套 namespace 没有对应执行能力，返回带具体 `param` 的 400；应在客户端为该渠道改用普通 function 工具。不会静默删除工具或伪造工具结果。
+
+本项目的 TypeScript Go Plan 代理默认监听 3000，`start.sh` 启动 `dist/index.js`。部署时应核对监听 PID；旧版 Go provider 服务可能使用其他端口及同名 systemd 服务，不能用其重启结果代替本服务验证。
 
 ## License
 

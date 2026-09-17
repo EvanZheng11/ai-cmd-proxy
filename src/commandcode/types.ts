@@ -1,5 +1,9 @@
 export type CommandCodeContentBlock =
   | {
+      type: "reasoning";
+      text: string;
+    }
+  | {
       type: "text";
       text: string;
     }
