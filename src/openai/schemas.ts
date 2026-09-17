@@ -17,6 +17,7 @@ const contentPartSchema = z.union([
 const messageSchema = z.object({
   role: z.enum(["system", "developer", "user", "assistant", "tool"]),
   content: z.union([z.string(), z.array(contentPartSchema)]).nullable().optional(),
+  reasoning_content: z.string().nullable().optional(),
   name: z.string().optional(),
   tool_call_id: z.string().optional(),
   tool_calls: z.array(z.object({
@@ -39,7 +40,7 @@ const toolSchema = z.object({
   }),
 });
 
-const responsesToolSchema = z.union([
+const responsesFunctionToolSchema = z.union([
   toolSchema,
   z.object({
     type: z.literal("function"),
@@ -49,6 +50,44 @@ const responsesToolSchema = z.union([
     strict: z.boolean().optional(),
   }),
 ]);
+
+const responsesToolSchema = z.union([
+  responsesFunctionToolSchema,
+  z.object({
+    type: z.literal("namespace"),
+    name: z.string().min(1),
+    description: z.string().optional(),
+    tools: z.array(responsesFunctionToolSchema),
+  }),
+]);
+
+export class ResponsesTranslationError extends Error {
+  readonly statusCode = 400;
+  readonly type = "invalid_request_error";
+
+  constructor(message: string, public readonly param: string, public readonly code: string) {
+    super(message);
+    this.name = "ResponsesTranslationError";
+  }
+}
+
+export function parseResponsesTools(input: unknown) {
+  // 在 union 校验前指出不支持的具体工具，避免只返回笼统的 invalid_union。
+  const checkTypes = (tools: unknown, path: string, allowNamespace: boolean) => {
+    if (!Array.isArray(tools)) return;
+    tools.forEach((tool, index) => {
+      if (!tool || typeof tool !== "object") return;
+      const param = `${path}[${index}]`;
+      if (tool.type === "namespace" && allowNamespace) {
+        checkTypes(tool.tools, `${param}.tools`, false);
+      } else if (typeof tool.type === "string" && tool.type !== "function") {
+        throw new ResponsesTranslationError(`不支持工具类型 ${tool.type}，仅支持 function 和 namespace 内的 function`, `${param}.type`, "unsupported_tool_type");
+      }
+    });
+  };
+  checkTypes(input, "tools", true);
+  return z.array(responsesToolSchema).parse(input);
+}
 
 export const chatCompletionRequestSchema = z.object({
   model: z.string().min(1),
@@ -78,12 +117,8 @@ export function parseChatCompletionRequest(input: unknown) {
 
 export const responsesRequestSchema = z.object({
   model: z.string().min(1),
-  input: z.union([
-    z.string(),
-    z.array(messageSchema),
-    z.array(contentPartSchema),
-    z.array(z.unknown()),
-  ]),
+  // Responses 条目的附加语义由转换器校验，不能先按 Chat schema 剥掉字段。
+  input: z.union([z.string(), z.array(z.unknown())]),
   instructions: z.string().optional(),
   stream: z.boolean().optional(),
   max_output_tokens: z.number().int().positive().optional(),
@@ -100,5 +135,8 @@ export const responsesRequestSchema = z.object({
 }).passthrough();
 
 export function parseResponsesRequest(input: unknown) {
+  if (input && typeof input === "object" && "tools" in input && input.tools !== undefined) {
+    parseResponsesTools(input.tools);
+  }
   return responsesRequestSchema.parse(input);
 }

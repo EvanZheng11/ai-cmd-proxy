@@ -188,7 +188,7 @@ describe("POST /v1/responses", () => {
     // 无 type 的 {"role":"user","content":...} 走 message 转换；
     // system/developer 会在后续 toCommandCodeMessages 里合并为 system。
     expect(result.messages).toEqual([
-      { role: "assistant", content: "You are an AI agent." },
+      { role: "system", content: "You are an AI agent." },
       { role: "user", content: "第一轮问题" },
       {
         role: "assistant",
@@ -203,7 +203,7 @@ describe("POST /v1/responses", () => {
       // 工具调用与发起消息不拆开，上游看到的历史才是连续的。
       {
         role: "assistant",
-        content: "先看目录结构",
+        reasoning_content: "先看目录结构",
         tool_calls: [{
           id: "call_01_def",
           type: "function",
@@ -552,8 +552,8 @@ describe("POST /v1/responses", () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toContain('event: error');
+    expect(response.statusCode).toBe(502);
+    expect(response.json().error.code).toBe("upstream_error");
     // 固定 workingDir 与客户端实例同生命周期，不再按请求清理。
     expect(removeTempDir).not.toHaveBeenCalled();
   });

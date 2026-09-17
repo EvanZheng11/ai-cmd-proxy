@@ -174,6 +174,9 @@ export function toCommandCodeMessages(messages: OpenAiChatMessage[]): {
 
   for (const message of messages) {
     const content = toContent(message.content);
+    if (message.role === "assistant" && message.reasoning_content) {
+      content.unshift({ type: "reasoning", text: message.reasoning_content });
+    }
     if (message.role === "system" || message.role === "developer") {
       systemParts.push(
         content

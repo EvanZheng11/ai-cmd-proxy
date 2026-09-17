@@ -1,3 +1,5 @@
+import type { ZodError } from "zod";
+
 export type OpenAiErrorType =
   | "authentication_error"
   | "invalid_request_error"
@@ -29,22 +31,35 @@ export class UpstreamStreamError extends Error {
   }
 }
 
-// 上游 NDJSON 错误事件的状态码位置不统一：既可能在顶层 statusCode，
-// 也可能嵌在 error.statusCode 里。两处都取不到时按 502 处理。
+// 上游使用 statusCode/status，可能位于顶层或 error 内。
 export function eventStatusCode(event: {
   statusCode?: number;
-  error?: string | { statusCode?: number };
+  status?: number;
+  error?: string | { statusCode?: number; status?: number };
 }): number {
-  if (typeof event.statusCode === "number" && event.statusCode >= 400) {
-    return event.statusCode;
-  }
-  if (typeof event.error === "object" && event.error !== null) {
-    const nested = event.error.statusCode;
-    if (typeof nested === "number" && nested >= 400) {
-      return nested;
-    }
-  }
-  return 502;
+  const nested = typeof event.error === "object" && event.error !== null ? event.error : undefined;
+  return [event.statusCode, event.status, nested?.statusCode, nested?.status]
+    .find((status): status is number => Number.isInteger(status) && status! >= 400 && status! <= 599) ?? 502;
+}
+
+function errorParam(path: readonly PropertyKey[]): string | null {
+  return path.reduce<string>((result, part) => typeof part === "number"
+    ? `${result}[${part}]` : `${result}${result ? "." : ""}${String(part)}`, "") || null;
+}
+
+export function validationError(error: ZodError, input: unknown, prefix: PropertyKey[] = []) {
+  const leaves = (issues: ZodError["issues"], parent: PropertyKey[]): ZodError["issues"] => issues.flatMap((issue) => {
+    const path = [...parent, ...issue.path];
+    return issue.code === "invalid_union"
+      ? issue.errors.flatMap((branch) => leaves(branch, path))
+      : [{ ...issue, path }];
+  });
+  const issues = leaves(error.issues, prefix);
+  // union 的不匹配分支可能报告不存在的字段，优先指出请求实际提供的字段。
+  const supplied = (path: PropertyKey[]) => path.reduce<unknown>((value, key) =>
+    value !== null && typeof value === "object" ? (value as Record<PropertyKey, unknown>)[key] : undefined, input) !== undefined;
+  issues.sort((a, b) => Number(supplied(b.path)) - Number(supplied(a.path)) || b.path.length - a.path.length);
+  return { message: issues[0]?.message ?? "Invalid request", param: errorParam(issues[0]?.path ?? []) };
 }
 
 // 把上游错误体里的可读消息透传给客户端（例如 "MODEL_NOT_IN_PLAN"），
@@ -94,7 +109,7 @@ export function upstreamOpenAiError(status: number, message = "CommandCode upstr
     || status === 408
     || status === 409
     || status === 429
-    || status >= 500;
+    || (Number.isInteger(status) && status >= 500 && status <= 599);
   const effectiveStatus = passthrough ? status : 502;
   const type: OpenAiErrorType = effectiveStatus === 401 || effectiveStatus === 403
     ? "authentication_error"
